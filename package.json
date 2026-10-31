@@ -1,0 +1,23 @@
+{
+  "name": "mathmate-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "GeometryJSON 教学骨架：用 JSON 描述数学场景，Three.js 渲染成可交互图形",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "katex": "^0.19.1",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/katex": "^0.16.8",
+    "@types/three": "^0.169.0",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8"
+  }
+}

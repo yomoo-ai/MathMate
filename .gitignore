@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.log
+
+# 部署打包
+*.zip
+
+# 开发过程截图（回归/证据/界面对比）
+evidence-*.png
+ui-before.png
+ui-after.png
+
+# 工作区数据
+.workbuddy/
+
+# IDE 配置
+.idea/
