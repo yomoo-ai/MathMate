@@ -45,6 +45,15 @@ function dotE(a: Tri, b: Tri): string {
   return `${p(a[0])} * ${p(b[0])} + ${p(a[1])} * ${p(b[1])} + ${p(a[2])} * ${p(b[2])}`;
 }
 
+/** 叉积（三个分量表达式） */
+function crossE(a: Tri, b: Tri): Tri {
+  return [
+    `${p(a[1])} * ${p(b[2])} - ${p(a[2])} * ${p(b[1])}`,
+    `${p(a[2])} * ${p(b[0])} - ${p(a[0])} * ${p(b[2])}`,
+    `${p(a[0])} * ${p(b[1])} - ${p(a[1])} * ${p(b[0])}`,
+  ];
+}
+
 /** 把坐标字段拆成三段；拆不出来返回 null */
 export function atParts3(at: Vec3Like | undefined): Tri | null {
   if (at === undefined || at === null) return null;
@@ -77,6 +86,26 @@ function computeDerive3(
         `(${p(A[1])} + ${p(B[1])}) / 2`,
         `(${p(A[2])} + ${p(B[2])}) / 2`,
       ];
+    }
+    case 'intersect': {
+      // 直线 P1P2 与 Q1Q2 的交点（按**无限长直线**算，所以能落在延长线上）：
+      //   P = P1 + t·r，t = [(Q1−P1) × w] · (r × w) / |r × w|²
+      // 两线平行或异面时 |r × w| = 0，结果会是 NaN/Infinity——
+      // 体检器会点名报错，不会悄悄画到别处去。
+      const P1 = coordOf(d.l1[0]);
+      const P2 = coordOf(d.l1[1]);
+      const Q1 = coordOf(d.l2[0]);
+      const Q2 = coordOf(d.l2[1]);
+      if (!P1 || !P2 || !Q1 || !Q2) return null;
+      const r = subE(P2, P1);
+      const w = subE(Q2, Q1);
+      const w0 = subE(Q1, P1);
+      const rw = crossE(r, w);
+      // dotE 返回的是「和式」而不是单个项，必须再包一层括号——
+      // 否则 a*b+a*c+a*d / den 只会把最后一项除下去（第一版就这么错了）。
+      const den = p(dotE(rw, rw));
+      const num = p(dotE(crossE(w0, w), rw));
+      return addE(P1, scaleE(`(${num} / ${den})`, r));
     }
     case 'centroid': {
       // 重心 = 三顶点坐标的算术平均（空间和平面上都是这个式子）

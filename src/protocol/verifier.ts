@@ -87,7 +87,11 @@ function checkObject(obj: SceneObject, scope: Record<string, number>): string[] 
         push(
           'at',
           obj.derive
-            ? `${err}（派生点没算出来：检查 derive 里引用的点是否存在、两条线是否平行——平行线没有交点）`
+            ? `${err}（${
+                obj.derive.kind === 'curve-point'
+                  ? '曲线上的点没算出来：检查 derive.curve 是否指向 parametric / curve / circle 对象的 id，t 是否是有效表达式'
+                  : '派生点没算出来：检查 derive 里引用的点是否存在、两条线是否平行——平行线没有交点'
+              }）`
             : err,
         );
       }
@@ -248,11 +252,163 @@ function collectConstraintPointIds(c: Constraint, out: Set<string>) {
   }
 }
 
+/* ===============================================================
+ * 曲线几何：点到曲线的最短距离
+ *
+ * 圆锥曲线题长期落在体检体系之外，原因很实在：所有约束都只处理"点和直线"
+ * （perp / on-segment / collinear），曲线上的点一个也管不住，于是提示词里
+ * 只能写"圆锥曲线不走 constraints"——图的正确性全靠模型目测。
+ *
+ * 这里用最笨但可靠的办法：参数采样 + 局部三分细化。曲线在协议里本来就是
+ * 参数化表达的（parametric 的 xExpr/yExpr、curve 的 y=f(x)、circle 的 cos/sin），
+ * 采样不引入任何新的数学假设，也不需要知道"这是椭圆还是双曲线"。
+ * =============================================================== */
+
+interface CurveSampler {
+  tMin: number;
+  tMax: number;
+  /** 参数 → 平面坐标；该参数无定义时返回 null */
+  at: (t: number) => P2 | null;
+  /** 曲线自身尺度（采样包围盒对角线），把绝对容差换算成相对量 */
+  scale: number;
+}
+
+/** 按对象类型造一个采样器；不是曲线（线段、多边形）返回 null */
+function buildCurveSampler(
+  obj: SceneObject,
+  scope: Record<string, number>,
+  view: Scene['view'],
+): CurveSampler | null {
+  const num = (v: unknown, fallback: number): number => {
+    try {
+      const n = evalNumber(String(v), scope);
+      return isFinite(n) ? n : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
+  let tMin = 0;
+  let tMax = 2 * Math.PI;
+  let at: (t: number) => P2 | null;
+
+  if (obj.type === 'parametric') {
+    const tr = obj.tRange;
+    if (Array.isArray(tr) && tr.length === 2) {
+      const a = num(tr[0], 0);
+      const b = num(tr[1], 2 * Math.PI);
+      if (b > a) {
+        tMin = a;
+        tMax = b;
+      }
+    }
+    at = (t) => {
+      try {
+        const x = evalNumber(String(obj.xExpr), { ...scope, t });
+        const y = evalNumber(String(obj.yExpr), { ...scope, t });
+        return isFinite(x) && isFinite(y) ? ([x, y] as P2) : null;
+      } catch {
+        return null;
+      }
+    };
+  } else if (obj.type === 'curve') {
+    const dom = obj.domain;
+    tMin = Array.isArray(dom) && dom.length === 2 ? num(dom[0], view.xMin) : view.xMin;
+    tMax = Array.isArray(dom) && dom.length === 2 ? num(dom[1], view.xMax) : view.xMax;
+    if (!(tMax > tMin)) {
+      tMin = view.xMin;
+      tMax = view.xMax;
+    }
+    at = (x) => {
+      try {
+        const y = evalNumber(String(obj.expr), { ...scope, x });
+        return isFinite(y) ? ([x, y] as P2) : null;
+      } catch {
+        return null;
+      }
+    };
+  } else if (obj.type === 'circle') {
+    const c = evalVec2Detailed(obj.center, scope).value;
+    const r = num(obj.radius, NaN);
+    if (!c || !isFinite(r) || r <= 0) return null;
+    return {
+      tMin: 0,
+      tMax: 2 * Math.PI,
+      at: (t) => [c[0] + r * Math.cos(t), c[1] + r * Math.sin(t)],
+      scale: 2 * r,
+    };
+  } else {
+    return null;
+  }
+
+  // 尺度：采样一圈取包围盒对角线。容差用它做相对量，
+  // 这样同一套判据在 [-7,7] 的椭圆和 [-20,20] 的爱心上都合适。
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i <= 64; i++) {
+    const q = at(tMin + ((tMax - tMin) * i) / 64);
+    if (!q) continue;
+    minX = Math.min(minX, q[0]);
+    maxX = Math.max(maxX, q[0]);
+    minY = Math.min(minY, q[1]);
+    maxY = Math.max(maxY, q[1]);
+  }
+  const scale = isFinite(minX) ? Math.hypot(maxX - minX, maxY - minY) || 1 : 1;
+  return { tMin, tMax, at, scale };
+}
+
+/**
+ * 点到曲线的最近点。先粗采样定位，再在相邻一格内三分细化。
+ *
+ * 为什么够用：教学图里的曲线都是"参数连续、没有病态抖动"的简单曲线，
+ * 最近点必然是局部单峰的；三分法在单峰区间上收敛，60 次迭代精度远超需要。
+ */
+function nearestOnCurve(s: CurveSampler, p: P2): { d: number; t: number; q: P2 } {
+  const N = 512;
+  const dt = (s.tMax - s.tMin) / N;
+  let best = { d: Infinity, t: s.tMin, q: p };
+  for (let i = 0; i <= N; i++) {
+    const t = s.tMin + dt * i;
+    const q = s.at(t);
+    if (!q) continue;
+    const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+    if (d < best.d) best = { d, t, q };
+  }
+  if (!isFinite(best.d)) return best;
+
+  let lo = best.t - dt;
+  let hi = best.t + dt;
+  for (let k = 0; k < 60; k++) {
+    const m1 = lo + (hi - lo) / 3;
+    const m2 = hi - (hi - lo) / 3;
+    const q1 = s.at(m1);
+    const q2 = s.at(m2);
+    const d1 = q1 ? Math.hypot(q1[0] - p[0], q1[1] - p[1]) : Infinity;
+    const d2 = q2 ? Math.hypot(q2[0] - p[0], q2[1] - p[1]) : Infinity;
+    if (d1 < d2) hi = m2;
+    else lo = m1;
+  }
+  const t = (lo + hi) / 2;
+  const q = s.at(t) ?? best.q;
+  const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+  return d < best.d ? { d, t, q } : best;
+}
+
+/** 约束验算需要但不属于"点坐标"的上下文 */
+interface ConstraintCtx {
+  /** 曲线 id → 曲线对象（on-curve 用） */
+  curves: Map<string, SceneObject>;
+  view: Scene['view'];
+}
+
 function checkConstraint(
   c: Constraint,
   pts: Map<string, P2>,
   where: string,
   scope: Record<string, number>,
+  ctx: ConstraintCtx,
 ): ConstraintIssue | null {
   const need = (id: string) => getP(pts, id, where);
 
@@ -463,6 +619,42 @@ function checkConstraint(
           `③ 把 a 的默认值改成解出的数。直接给每个坐标乘 ${(want / (got || 1)).toFixed(4)} 会让其他约束一起失效，不要这么做`,
       };
     }
+    case 'on-curve': {
+      const pId = String(c.p ?? '');
+      const curveId = String(c.curve ?? '');
+      const curveObj = ctx.curves.get(curveId);
+      if (!curveObj) {
+        return {
+          level: 'warn',
+          message:
+            `on-curve 引用的曲线「${curveId}」不存在（或不是 parametric / curve / circle 对象），这条关系没法验算。` +
+            `curve 要写曲线对象的 id，不是数学式`,
+        };
+      }
+      const P = need(pId);
+      if (P.issue) return P.issue;
+      const sampler = buildCurveSampler(curveObj, scope, ctx.view);
+      if (!sampler) {
+        return {
+          level: 'warn',
+          message: `曲线「${curveId}」在默认参数下没有有效坐标（表达式算不出数），on-curve 没法验算`,
+        };
+      }
+      const near = nearestOnCurve(sampler, P.p!);
+      if (!isFinite(near.d)) {
+        return { level: 'warn', message: `曲线「${curveId}」采样后一个有效点都没有，on-curve 没法验算` };
+      }
+      const tol = isFinite(Number(c.tol)) ? Number(c.tol) : Math.max(0.01, 0.002 * sampler.scale);
+      if (near.d <= tol) return null;
+      return {
+        level: 'error',
+        message:
+          `「${pId} 在曲线 ${curveId} 上」不成立：${pId}${fmtP(P.p!)} 到曲线最近处 ${fmtP(near.q)} 还有 ${near.d.toFixed(2)} 的距离。` +
+          `修法：曲线上的点不要手写坐标（手写的坐标几乎不可能正好落在曲线上），改用 derive 取点：` +
+          `{"type":"point","id":"${pId}","derive":{"kind":"curve-point","curve":"${curveId}","t":"${near.t.toFixed(3)}"}}` +
+          `——t 是曲线的参数，改它可以让点沿曲线移动`,
+      };
+    }
     default:
       return {
         level: 'warn',
@@ -495,6 +687,33 @@ export function measureReadouts(scene: Scene): Array<{ label: string; value: str
   return out;
 }
 
+/**
+ * 这个点有没有被别处用到（线段端点、圆心、多边形顶点、derive 的依赖、
+ * readouts 里的 "dist(A,B)"、steps 里提到的点……）。
+ *
+ * 用"序列化后整词匹配"，而不是逐字段列举：协议里引用点的方式太多，
+ * 漏掉一种就会把好图误判成孤点。这里宁宽勿严——判成"被引用"最多多一条提醒，
+ * 判成"孤点"却会把一份可能正确的图打回重做。
+ */
+function isReferencedByOthers(id: string, scene: Scene): boolean {
+  const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(^|[^A-Za-z0-9_])${esc}([^A-Za-z0-9_]|$)`);
+  const mentions = (v: unknown): boolean => {
+    try {
+      return re.test(JSON.stringify(v) ?? '');
+    } catch {
+      return false;
+    }
+  };
+  for (const o of scene.objects) {
+    if ((o as { id?: string }).id === id) continue;
+    if (mentions(o)) return true;
+  }
+  for (const r of scene.readouts ?? []) if (mentions(r)) return true;
+  for (const s of scene.steps ?? []) if (mentions(s)) return true;
+  return false;
+}
+
 /** 体检主入口：返回问题清单（空数组 = 全部通过） */
 export function verifyScene(scene: Scene): Issue[] {
   const issues: Issue[] = [];
@@ -503,8 +722,31 @@ export function verifyScene(scene: Scene): Issue[] {
   const scope = defaultScope(scene);
 
   // ---- 顶层检查 ----
-  if (scene.objects.length === 0) {
+  // 没写 visual 又零对象才提醒；写了 figure 的情况下面有专门的 error，
+  // 写了 board 则是正常的（本来就不该有图）
+  if (scene.objects.length === 0 && scene.visual === undefined) {
     add('warn', '-', '场景里没有任何对象，画布会是空的');
+  }
+
+  // ---- 出图 / 板书 的一致性闸门 ----
+  // 声明了 figure 却一个对象都没有，说明它嘴上说要画、手上什么也没画。
+  // 这种场景硬渲染只会得到一张空坐标轴，比板书更糟，所以打回重写；
+  // 重试用完仍未画出来时，runGeneration 会把它降级成 board 而不是整个丢掉。
+  if (scene.visual === 'figure' && scene.objects.length === 0) {
+    add(
+      'error',
+      'visual',
+      '声明了 visual:"figure"（要出图）却一个图形对象都没有。' +
+        '要么补上真正能对应讲解的图形（objects 至少要有被 steps 指到的对象），' +
+        '要么改成 visual:"board"（改用推导板书，不画图）',
+    );
+  }
+  if (scene.visual === 'board' && scene.objects.length > 0) {
+    add(
+      'warn',
+      'visual',
+      `visual:"board" 表示改用推导板书，已登记的 ${scene.objects.length} 个图形对象不会渲染`,
+    );
   }
   const spanX = scene.view.xMax - scene.view.xMin;
   const spanY = scene.view.yMax - scene.view.yMin;
@@ -528,6 +770,13 @@ export function verifyScene(scene: Scene): Issue[] {
   const ids = new Set<string>();
   /** 点 id → 当前参数下的实际坐标（约束验算要用） */
   const pointCoords = new Map<string, [number, number]>();
+  /** 曲线 id → 曲线对象（on-curve 与 curve-point 要按 id 找定义） */
+  const curves = new Map<string, SceneObject>();
+  for (const obj of scene.objects) {
+    if (obj.type === 'parametric' || obj.type === 'curve' || obj.type === 'circle') {
+      curves.set(obj.id, obj);
+    }
+  }
   for (const obj of scene.objects) {
     if (ids.has(obj.id)) {
       add('error', obj.id, '对象 id 重复，步骤高亮和显示控制会串台');
@@ -539,6 +788,42 @@ export function verifyScene(scene: Scene): Issue[] {
     if (obj.type === 'point') {
       const r = evalVec2Detailed(obj.at ?? '', scope);
       if (r.value) pointCoords.set(obj.id, r.value);
+
+      // 曲线上的点：引用错了曲线、或参数跑到曲线外面，都要说清楚。
+      // 这两种情况在坐标层面只表现为"点位置不对"，不单独解释很难定位。
+      const d = obj.derive;
+      if (d && d.kind === 'curve-point') {
+        const cid = String(d.curve ?? '');
+        const curveObj = curves.get(cid);
+        if (!curveObj) {
+          add(
+            'error',
+            obj.id,
+            `derive 说这个点在曲线「${cid}」上，但 objects 里没有这个 id（也可能是它并不是 parametric / curve / circle）。` +
+              `curve 要写曲线对象的 id`,
+          );
+        } else {
+          const sampler = buildCurveSampler(curveObj, scope, scene.view);
+          let tVal = NaN;
+          try {
+            tVal = evalNumber(String(d.t), scope);
+          } catch {
+            /* evalNumber 抛错时保持 NaN，下面按"不一定越界"处理 */
+          }
+          if (
+            sampler &&
+            isFinite(tVal) &&
+            (tVal < sampler.tMin - 1e-9 || tVal > sampler.tMax + 1e-9)
+          ) {
+            add(
+              'warn',
+              obj.id,
+              `曲线参数 t=${tVal.toFixed(3)} 超出曲线「${cid}」的范围 ` +
+                `[${sampler.tMin.toFixed(3)}, ${sampler.tMax.toFixed(3)}]，这个点会落在曲线范围之外`,
+            );
+          }
+        }
+      }
     }
     // label 约定 ≤10 字符，超长会在图上互相遮挡
     if (obj.label && obj.label.length > 10) {
@@ -552,7 +837,10 @@ export function verifyScene(scene: Scene): Issue[] {
       add('warn', `constraints[${i}]`, '缺少 type，已跳过');
       return;
     }
-    const issue = checkConstraint(c, pointCoords, `constraints[${i}]`, scope);
+    const issue = checkConstraint(c, pointCoords, `constraints[${i}]`, scope, {
+      curves,
+      view: scene.view,
+    });
     if (issue) add(issue.level, `constraints[${i}]`, issue.message);
   });
 
@@ -561,19 +849,68 @@ export function verifyScene(scene: Scene): Issue[] {
   // 用户看到的就是"图和题目不符"。这里补两层，都只给 warn（不拦截，但让人看见）。
 
   // ① 没有任何约束管住的点 —— 它的坐标是模型随手写的，无从验证
+  //
+  // 分两档处置，判据是"这个点在图上到底有没有归属"：
+  //   有归属（被 id 引用 / 与某个线段的端点或圆心重合）→ 只提醒。
+  //     模型经常用坐标而不是 id 来引用点，这时按 id 查会漏，必须按位置再查一次。
+  //   孤点（无约束、无引用、无坐标重合，而且场景里不止它一个点）→ 报 error。
+  //     真实事故：F1、F2 两个"标记点"飘在图上，讲解一句都没用到它们，
+  //     位置也是随手写的 —— 这正是"图与题对不上"的来源。
+  //     只有一个点时放宽成提醒：那更像"顶点/动点"这类合法标注。
   const watched = new Set<string>();
   for (const c of scene.constraints ?? []) collectConstraintPointIds(c, watched);
+
+  const occupied: P2[] = [];
+  for (const o of scene.objects) {
+    if (o.type === 'point') continue;
+    const r = o as unknown as Record<string, unknown>;
+    const push = (v: unknown) => {
+      if (v === undefined) return;
+      const p = evalVec2Detailed(v as Parameters<typeof evalVec2Detailed>[0], scope).value;
+      if (p) occupied.push(p);
+    };
+    push(r.from);
+    push(r.to);
+    push(r.center);
+    push(r.at);
+    if (Array.isArray(r.points)) for (const p of r.points) push(p);
+  }
+  const pointTotal = scene.objects.filter((o) => o.type === 'point').length;
+
   for (const obj of scene.objects) {
     if (obj.type !== 'point') continue;
     if (obj.derive) continue; // 派生点：位置由定义锁定
     if (obj.dragBind) continue; // 可拖点：位置由用户调
     if (watched.has(obj.id)) continue;
+
+    const warnUntrusted = () =>
+      add(
+        'warn',
+        obj.id,
+        '这个点的位置没被任何约束验证过，可能与题意不符。' +
+          '如果它是题面里真实存在的点，就在 constraints 里登记它参与的关系，或改用 derive 推出坐标',
+      );
+
+    if (isReferencedByOthers(obj.id, scene)) {
+      warnUntrusted();
+      continue;
+    }
+    const p = pointCoords.get(obj.id);
+    const shares = p
+      ? occupied.some((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) < 1e-6)
+      : false;
+    if (shares || pointTotal <= 1) {
+      warnUntrusted();
+      continue;
+    }
     add(
-      'warn',
+      'error',
       obj.id,
-      '这个点的位置没被任何约束验证过，可能与题意不符。' +
-        '如果它只是直角/等长之类的"标记点"，直接删掉，用 constraints（perp / equal-length）表达；' +
-        '如果它是题面里真实存在的点，就在 constraints 里登记它参与的关系，或改用 derive 推出坐标',
+      '这个点是"孤点"：没有任何线段/圆/多边形用到它，位置也没有任何约束保证——' +
+        '图上只会多出一个来路不明的点和标签，讲解也用不上。三选一：' +
+        '① 如果它只是直角/等长之类的"标记点"，删掉它，用 constraints（perp / equal-length）表达；' +
+        '② 如果它确实是题面里的点，在 constraints 里登记它参与的关系；' +
+        '③ 如果位置该由别的点算出来，改用 derive（foot / section / midpoint / intersect）',
     );
   }
 

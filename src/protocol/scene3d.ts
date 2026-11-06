@@ -49,11 +49,20 @@ export interface Point3Object extends Base3D {
 
 /**
  * 3D 派生点。
- * 与 2D 版本的区别：多一个 centroid（三角形重心），少一个 intersect
- * （空间中两条直线多数是异面直线，没有交点，"求交"在立体几何里不常用）。
+ * 与 2D 版本的区别：多一个 centroid（三角形重心）。
+ *
+ * 也保留了 intersect（两直线求交），因为**延长线法**是立体几何作截面的
+ * 标准手法："延长 DM 交 AA₁ 于 P"——这里的 DM 和 AA₁ 往往不在同一段棱上，
+ * 必须按"整条直线"求交。没有它，模型只能给 P 手写坐标（无从验证，
+ * 且多半会算错），或者干脆不画这个点（图上就少了讲解里提到的点）。
  */
 export type Derive3Spec =
   | { kind: 'midpoint'; a: string; b: string }
+  /**
+   * 直线 l1(a,b) 与直线 l2(c,d) 的交点（**按无限长直线求交**，可以落在延长线上）。
+   * 两条直线异面时不报错但体检器会拦——见 verifier3d 的 skew 检查。
+   */
+  | { kind: 'intersect'; l1: [string, string]; l2: [string, string] }
   /** 三角形 A B C 的重心 = 三顶点坐标的平均 */
   | { kind: 'centroid'; points: [string, string, string] }
   /** P = A + t·(B−A)，t 是数字或表达式（"1/3"） */

@@ -24,6 +24,18 @@
       </header>
       <main>
         <div id="canvas-container">
+          <!-- 推导模式：没有可对应图形的题（纯代数/不等式/参数范围）不画图，
+               改排推导板书。顶部那行小字说明"为什么没有图"，避免被当成故障 -->
+          <div id="derive-board" hidden>
+            <div id="db-note">
+              <span id="db-note-text"></span>
+              <!-- 模型可能把有图的题判成"没有图形"：给一条自己爬出来的路 -->
+              <button class="btn db-peek" id="db-peek" hidden>仍要看图</button>
+            </div>
+            <div id="db-body"></div>
+          </div>
+          <!-- 从推导板切到图形后，回去的入口（推导板本身已经藏起来了） -->
+          <button class="btn db-back" id="db-back" hidden>← 回推导板</button>
           <div id="notebook" hidden>
             <div class="nb-head">
               <span class="nb-head-title">我的题本</span>

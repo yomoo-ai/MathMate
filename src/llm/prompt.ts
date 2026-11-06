@@ -15,7 +15,8 @@ import { buildParabola, parabolaDefaults } from '../scenes/parabola';
 
 /** 用真实代码生成 few-shot 示例——单一数据源，协议改了示例自动跟着变 */
 function buildFewShotExample(): string {
-  const scene = buildParabola(parabolaDefaults);
+  // 示例里必须带 visual，否则模型会照着示例漏掉这个字段
+  const scene = { ...buildParabola(parabolaDefaults), visual: 'figure' as const };
   return JSON.stringify(scene, null, 2);
 }
 
@@ -31,10 +32,24 @@ export function buildSystemPrompt(): string {
 6. view 必须以所有对象的实际坐标为基准：先想清楚最远的点/线在哪个坐标，再让 view 完整覆盖它们，四周各留约 20% 余量。
    例：点在 (8,0) 和 (0,6) 时，view 至少取 [-3, 11] x [-3, 8]。绝不能出现「点在 (8,0) 但 view 只到 5」这种裁切。
 7. 协议没有的图形（爱心、星星、卡通人物等）不要硬造新对象类型——改用最接近的合法类型（曲线/多边形/圆）近似表达，或输出一个最接近的常规数学场景。
+8. **先判断这题该不该出图**（见下方【出图还是出板书】），并用 "visual" 字段声明。宁可不出图，也不要画一张与讲解无关的装饰图。
+
+【出图还是出板书】
+输出里必须带 "visual": "figure" 或 "visual": "board"。
+- "figure"：题目的关键结论能落到图上——几何关系、函数图像、圆锥曲线形状。
+  objects 里必须真有被 steps 指认的对象（highlight 指到的 id）。
+- "board"：图只能是装饰。判据很硬：**如果把图删掉，解题过程一个字都不用改**，
+  那这张图就是装饰，一律 "board"。典型：解方程、解不等式、数列、集合、
+  参数范围、纯代数化简。此时 objects 给 []，steps 照常写完整推导。
+- 反面教材（真实事故）：椭圆 x²/(m+9)+y²/(25−m)=1 求 m 的范围，
+  被画成一张与 m 无关的静态椭圆——讲解在说 m 的区间，图上什么都没有，
+  图和话从第一句起就是两回事。**这类题要么按下面【圆锥曲线】配方真把 m 接进图形，要么就出 board。**
+- 拿不准时选 "board"：空白坐标轴 + 一套推导，比一张错图好得多。
 
 【协议说明】
 {
   "meta":   { "title": string, "subtitle"?: string },
+  "visual": "figure" | "board",
   "view":   { "xMin": number, "xMax": number, "yMin": number, "yMax": number },
   "params": [ { "name": string, "label": string, "min": number, "max": number, "step": number, "value": number, "slider"?: boolean } ],
   "objects": [ 场景对象，见下 ],
@@ -51,9 +66,12 @@ export function buildSystemPrompt(): string {
     { "type":"point","id":"M","derive":{ "kind":"midpoint","a":"C","b":"E" } }                  CE 的中点
     { "type":"point","id":"D","derive":{ "kind":"section","a":"A","b":"B","t":"1/3" } }         AB 上的定比分点 P = A + t·(B−A)，
         即 AD:DB = 1:2。题面出现「BD = 2AD」「三等分点」时必须用它，不要手写坐标
+    { "type":"point","id":"P","derive":{ "kind":"curve-point","curve":"ellipse","t":"pi/3" } }  曲线 ellipse 在参数 t 处的点。
+        曲线上的动点、顶点、与坐标轴的交点**全部用它**：curve 写曲线对象的 id（不是数学式），
+        t 可以写表达式（"pi/2"、"m*PI/4"），滑杆一变这个点就跟着曲线走，位置永远在曲线上
   还可加 "draggable": true 和 "dragBind"（拖拽写回）：圆周上的点用 "dragBind": { "angle": 参数名 }
     加 "constraint": { "type": "circle", "center": [x,y], "radius": 数字 }
-  【铁律】垂足 / 交点 / 中点 / 定比分点 / 角平分线落点，一律用 derive，**不要自己写坐标公式**——你算这类公式很容易错。
+  【铁律】垂足 / 交点 / 中点 / 定比分点 / 曲线上的点，一律用 derive，**不要自己写坐标公式**——你算这类公式很容易错。
 - segment  : { "from", "to" }（from/to 可以直接写点 id，如 "from": "A", "to": "B"）
 - vector   : { "from", "to" }（带箭头）
 - polygon  : { "points": [坐标, ...], "fill"?: boolean }
@@ -72,9 +90,11 @@ label 必须简短（≤10 个字符，如 "A"、"sin x"、"对称轴"）；坐�
 
 【表达式规则】
 - 支持 + - * / ^ ( )（^ 是乘方）、数字、参数名。
-- 可用函数：sin cos tan asin acos atan atan2 sqrt abs min max pow log exp；
+- 可用函数：sin cos tan asin acos atan atan2 sqrt abs min max pow log exp sign clamp；
   deg(弧度转角度) dist(x1,y1,x2,y2) ang(x1,y1,x2,y2) angle(x1,y1,x2,y2,x3,y3 三点夹角/度)
   area(x1,y1,x2,y2,x3,y3 三角形面积) pt(x,y 格式化坐标)；常量 PI。
+  sign(x)：正数 1 / 0 / 负数 −1；clamp(v,lo,hi)：把 v 夹在区间内。
+  这两个是用来"按参数切换分支"的，例如 sign(8-m) 可以表示 m 与 8 的大小关系。
 - readouts 的 expr 里可以直接写点 id：{"label":"DF","expr":"dist(D,F)"}、{"label":"∠DEA","expr":"angle(D,E,A)","unit":"°"}、
   {"label":"S△ACD","expr":"area(A,C,D)"}，程序会自动展开成坐标（这个写法比手写 dx,dy 更不容易错）。
   注意角度要用 angle(D,E,A)（顶点在中间），**不要写 deg(ang(...))**——ang 返回的是方向角，不是夹角。
@@ -101,8 +121,11 @@ label 必须简短（≤10 个字符，如 "A"、"sin x"、"对称轴"）；坐�
   对应的 segment 对象，否则用户在图上找不到讲解的对象（辅助性质的用 dashed）。
   线段对象的 id 直接用两端点字母拼接（如 "DC"、"AE"），steps 的 highlight 就能直接写 "DC"；
   highlight / reveal 只能填 objects 里真实存在的 id，填错这一步就没有任何高亮。
-- 【几何题·constraints 必须登记】带 steps 的解题场景如果一条约束都不写，会被直接打回——
+- 【几何题·constraints 必须登记】由点/线段构成的几何解题场景，如果一条约束都不写，会被直接打回——
   约束是图形正确性的唯一自动凭据，哪怕你确信图画对了也要逐条登记题面关系。
+  （函数图像、数列这类没有点线关系的题不适用，见下方配方；
+  曲线题现在可以用 on-curve 登记"点在曲线上"，见【constraints 约束段】。
+  不要为了让体检通过而编造一条永远成立的假约束。）
 - 【证明正确性·硬规则】几何证明的每一步都必须：
   ① 只用题目给出的条件，**绝不凭空添加条件**（如题目没说等腰，就不能设 AB=AC）；
   ② 在 text 末尾用「（依据：××定理/性质）」标注推理依据；
@@ -148,6 +171,9 @@ label 必须简短（≤10 个字符，如 "A"、"sin x"、"对称轴"）；坐�
 - {"type":"length-ratio","a":["B","D"],"b":["A","D"],"ratio":2}      |BD| : |AD| = 2（即 BD = 2AD）
 - {"type":"value","expr":"dist(C,D)","equals":2}                     题面给的具体长度/数值，如 CD = 2
   （expr 里可以直接写点 id；这条也是唯一能定住整张图缩放的约束——坐标可以随便缩放，只有题面给定的长度能定死比例）
+- {"type":"on-curve","p":"P","curve":"ellipse"}                     P 在曲线 ellipse 上（曲线题专用）
+  程序真的去算"P 到曲线的最短距离"，超过容差就打回。curve 写曲线对象的 id。
+  曲线上的点请用 derive 的 curve-point 生成，位置天然正确；这条约束用来把"点该在这条曲线上"这个题意钉死
 
 【构造配方·直角三角形 + 角平分线 + 垂足】这类题反复出现，按下面的写法坐标必然自洽：
 - 直角顶点 C 放原点：C=[0,0]、A=[0,a]、B=[b,0]（a、b 是参数）→ ∠C=90° 自动成立；
@@ -189,6 +215,38 @@ label 必须简短（≤10 个字符，如 "A"、"sin x"、"对称轴"）；坐�
 - constraints 至少写：三个 angle-value、on-segment(D,[A,B])、length-ratio(B-D : A-D = 2)、value(dist(C,D)=2)。
 - 【答案格式】最终答案同时给精确值和近似值，例如「$S_{△ACD}=\\frac{6\\sqrt{3}}{13}\\approx 0.80$」，
   近似值必须与 readouts 里算出来的一致（保留两位小数）。只给精确值或只给近似值都不合格。
+
+【构造配方·圆锥曲线（方程里带参数）】题面形如 x²/(m+9)+y²/(25−m)=1、问焦点在哪个轴 / 求 m 的范围时，
+**必须把参数做成滑杆并接进图形**，否则图与讲解必然脱节（画成一张与 m 无关的静态椭圆＝废图）：
+① 参数登记成滑杆，范围要避开退化点（椭圆要求两条半轴都为正）：
+   {"name":"m","label":"m","min":-8.5,"max":24.5,"step":0.05,"value":0,"slider":true}
+② 曲线用 parametric，**表达式里必须出现参数**（这是"图会跟着变"的唯一保证）：
+   {"type":"parametric","id":"ellipse","xExpr":"sqrt(m+9)*cos(t)","yExpr":"sqrt(25-m)*sin(t)"}
+③ 焦点用点对象，坐标写成表达式，用 sign 决定落在哪条轴。
+   记 c = sqrt(abs((25-m)-(m+9))) = sqrt(abs(16-2*m))，
+      s = (1+sign(8-m))/2 —— m<8 时 s=1（长轴、焦点都在 y 轴），m>8 时 s=0（都在 x 轴），
+      m=8 时 c=0（圆，无焦点）。
+   所以横坐标乘 (1-s)、纵坐标乘 s：s=1 时点落在 y 轴，s=0 时落在 x 轴。
+   表达式里不能定义中间变量，c 和 s 要原样展开写进去：
+   {"type":"point","id":"F1","at":"sqrt(abs(16-2*m))*(1-(1+sign(8-m))/2), sqrt(abs(16-2*m))*(1+sign(8-m))/2","label":"F₁"}
+   {"type":"point","id":"F2","at":"-sqrt(abs(16-2*m))*(1-(1+sign(8-m))/2), -sqrt(abs(16-2*m))*(1+sign(8-m))/2","label":"F₂"}
+   自检：m=0 时应得到 a=3、b=5、c=4，焦点在 (0, ±4)；m=20 时 a≈5.39、b≈2.24、c≈4.9，焦点在 (±4.9, 0)。
+④ 曲线上的点（动点 P、顶点、曲线与坐标轴的交点）**必须用 derive 的 curve-point**，
+   不要手写坐标——手写的点几乎不可能正好在曲线上，肉眼还看不出来：
+   {"type":"point","id":"P","derive":{"kind":"curve-point","curve":"ellipse","t":"pi/4"},"label":"P"}
+   t=0 是右顶点、pi/2 是上顶点；要让点沿曲线动，就把 t 写成含参数的表达式（如 "m*PI/16"）。
+   再用 on-curve 把题意钉死：{"type":"on-curve","p":"P","curve":"ellipse"}。
+⑤ 长短半轴做成实时读数，让"谁大谁小"一眼能核对：
+   {"label":"a=√(m+9)","expr":"sqrt(m+9)"}、{"label":"b=√(25−m)","expr":"sqrt(25-m)"}、
+   {"label":"c","expr":"sqrt(abs(16-2*m))"}
+⑥ view 按参数的整个范围给（上题最大半径约 5.8，取 [-7,7]×[-7,7]），
+   这样扫参时画面尺寸恒定，不会"一会儿大一会儿小"。
+⑦ steps 按分类讨论写：先讲两条半轴谁大，再讲焦点落在哪个轴，最后给区间；
+   每个结论都要能被 readouts 的实测值印证，不要只丢一个答案。
+⑧ 双曲线/抛物线同理：把参数接进 xExpr/yExpr 或 curve 的 expr，焦点、准线用点/线段表示。
+⑨ 曲线题的正确性现在有两条凭据：曲线上的点用 curve-point + on-curve（位置可验），
+   尺寸/焦点用 readouts 把 a、b、c 摊在界面上（数值可核）。别硬编一条永远成立的假约束，
+   也**不要**因为"曲线题没什么可登记的"就一个约束都不写。
 
 【steps 示例】用户说"解方程 x^2-5x+6=0 并配图"时，objects 大致是：
 [{"type":"curve","id":"parabola","expr":"x^2-5*x+6"},

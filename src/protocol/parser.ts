@@ -94,7 +94,7 @@ export function parseScene(input: string): ParseResult {
           // 点有两写法：手写坐标（at），或声明几何关系让程序算（derive）
           if (o.derive !== undefined) {
             const d = o.derive;
-            const kinds = ['midpoint', 'foot', 'intersect', 'section'];
+            const kinds = ['midpoint', 'foot', 'intersect', 'section', 'curve-point'];
             if (!d || typeof d !== 'object' || !kinds.includes(d.kind)) {
               errors.push(
                 `objects[${i}]（point）的 derive.kind 必须是 ${kinds.join(' / ')}，例如 {"kind":"midpoint","a":"C","b":"E"}`,
@@ -114,10 +114,13 @@ export function parseScene(input: string): ParseResult {
               (d.kind === 'section' &&
                 (typeof d.a !== 'string' ||
                   typeof d.b !== 'string' ||
+                  (typeof d.t !== 'number' && typeof d.t !== 'string'))) ||
+              (d.kind === 'curve-point' &&
+                (typeof d.curve !== 'string' ||
                   (typeof d.t !== 'number' && typeof d.t !== 'string')))
             ) {
               errors.push(
-                `objects[${i}]（point）的 derive 缺少必要的点 id：midpoint 要 a/b，foot 要 p 和 line[2]，intersect 要 l1[2] 和 l2[2]，section 要 a/b/t`,
+                `objects[${i}]（point）的 derive 缺少必要字段：midpoint 要 a/b，foot 要 p 和 line[2]，intersect 要 l1[2] 和 l2[2]，section 要 a/b/t，curve-point 要 curve（曲线对象 id）和 t（曲线参数）`,
               );
             }
           } else {
@@ -231,6 +234,15 @@ export function parseScene(input: string): ParseResult {
     errors.push('constraints 必须是数组（每项是一条几何关系声明）');
   }
 
+  // visual：出图还是出板书。只认两个值，防止模型自创 "none"/"chart" 之类
+  if (
+    data.visual !== undefined &&
+    data.visual !== 'figure' &&
+    data.visual !== 'board'
+  ) {
+    errors.push('visual 只能是 "figure"（有对应图形）或 "board"（改用推导板书）');
+  }
+
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -252,6 +264,7 @@ export function parseScene(input: string): ParseResult {
     readouts: Array.isArray(data.readouts) ? data.readouts : [],
     steps: Array.isArray(data.steps) ? data.steps : undefined,
     constraints: Array.isArray(data.constraints) ? data.constraints : undefined,
+    visual: data.visual === 'board' ? 'board' : data.visual === 'figure' ? 'figure' : undefined,
   };
   // 补全：解出派生点坐标、把 "from": "A" 这类点 id 引用换成坐标表达式。
   // 放在校验之后、返回之前——渲染器和体检器拿到的永远是"坐标齐全"的场景。

@@ -99,7 +99,26 @@ export type DeriveSpec =
    * 都应该用 section 而不是手写坐标——比例关系天然成立，不用算。
    * t 可以是数字，也可以是表达式字符串（如 "1/3"、"2/(1+sqrt(5))"）。
    */
-  | { kind: 'section'; a: string; b: string; t: number | string };
+  | { kind: 'section'; a: string; b: string; t: number | string }
+  /**
+   * 曲线上的点：P = 曲线 curve 在参数 t 处的那个点。
+   *
+   * 为什么需要？——曲线题里的动点（"P 是椭圆上一点"）以前只能手写坐标，
+   * 而手写的坐标几乎不可能真的落在曲线上，程序也无从验证。
+   * 真实事故：椭圆题上的 P 飘在曲线外，焦点 F1/F2 也是随手写的数，
+   * 图与讲解从第一句就是对不上的。
+   *
+   * 用 curve-point 声明后，坐标直接取曲线在这点的表达式：
+   *   - 曲线随参数动（滑杆推 m），P 跟着一起动；
+   *   - 位置天然在曲线上，on-curve 一定成立，也不会被当成"孤点"；
+   *   - t 可以写表达式，如 "pi/2"、"m*pi/4"。
+   *
+   * curve 支持 parametric / curve / circle 三种对象：
+   *   parametric → (xExpr(t), yExpr(t))
+   *   curve      → (t, expr(t))   即把 t 当 x 用
+   *   circle     → (cx + r·cos t, cy + r·sin t)
+   */
+  | { kind: 'curve-point'; curve: string; t: number | string };
 
 /** 点：可拖拽，拖拽时把坐标写回参数 */
 export interface PointObject extends BaseObject {
@@ -258,7 +277,33 @@ export type Constraint =
    * 只有题面给定的长度能把比例定死。表达式里可以直接写点 id（如 "dist(C,D)"）。
    * tol 是相对容差，默认 0.005（0.5%）。
    */
-  | { type: 'value'; expr: string; equals: number; tol?: number };
+  | { type: 'value'; expr: string; equals: number; tol?: number }
+  /**
+   * 点在曲线上：p 到曲线 curve 的**最近距离**必须小于 tol（缺省按曲线尺寸取）。
+   *
+   * 为什么需要？——上面所有约束都只管"点和直线"的关系，圆锥曲线题一个也套不上，
+   * 于是提示词里只能写"圆锥曲线不走 constraints"。结果是曲线上的点（动点 P、
+   * 顶点、与坐标轴的交点）位置完全没人验证，全靠模型目测。
+   *
+   * curve 可以是 parametric / curve / circle 的 id。
+   * 曲线题里的动点优先用 derive 的 curve-point（位置天然正确），
+   * 这个约束用于验证"我确实想让它落在这条曲线上"的既有点。
+   */
+  | { type: 'on-curve'; p: string; curve: string; tol?: number };
+
+/**
+ * 出图还是出板书。
+ *
+ * 为什么需要它？——不是所有题都能画。解方程、不等式、数列、参数范围这类题
+ * 的"图"只能是装饰：把 m 的取值讨论硬配一张曲线，图和讲解从第一句起就是
+ * 两回事（真实事故：x²/(m+9)+y²/(25−m)=1 画成了一张与 m 无关的椭圆）。
+ *
+ * 与其画一张会误导的图，不如老实排推导板书。
+ *   'figure' —— 结论能落在图上，正常渲染
+ *   'board'  —— 不画图，改用推导板（主画布与视频都走这条路）
+ * 缺省时由 core/visualMode 推断（有步骤但零对象 → board）。
+ */
+export type VisualMode = 'figure' | 'board';
 
 /** 一份完整的场景描述 */
 export interface Scene {
@@ -270,4 +315,6 @@ export interface Scene {
   steps?: StepDef[];
   /** 几何关系声明（可选）。写了的会被体检器逐条验算 */
   constraints?: Constraint[];
+  /** 出图还是出板书；省略时按对象数量推断 */
+  visual?: VisualMode;
 }

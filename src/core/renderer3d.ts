@@ -37,6 +37,7 @@ import {
   type SolidSpec,
 } from '../protocol/sectionMath';
 import { makeTextSprite } from './textSprite';
+import type { AnnotationMark3D } from './annotations3d';
 import {
   axisFrame,
   solidCenter,
@@ -75,6 +76,12 @@ const COLORS = {
   label: '#2c2c2a',
 };
 
+/** 视频讲解的"重点色"（与 2D 一致）：本句讲到的棱换成暖橙 */
+const HL_COLOR = 0xea580c;
+
+/** 标注文字色（与 2D 的 ACCENT_CSS 一致）：比线条的橙更深一档，远看也认得出是字 */
+const ANN_TEXT = '#c2410c';
+
 /** 三条坐标轴的颜色：沿用数学软件的约定（x 红 / y 绿 / z 蓝），但调低饱和 */
 const AXIS_COLORS = {
   x: 0xb8544a,
@@ -100,7 +107,13 @@ interface EdgeItem {
   dashedNow: boolean;
   /** 被"步骤高亮"压暗（当前步没讲到它） */
   dim: boolean;
+  /** 实线/虚线各自的原本颜色——高亮结束后要能还回去 */
+  baseColor: number;
+  baseHiddenColor: number;
 }
+
+/** 构建动画的"已完成"状态：不在 buildMap 里的对象一律按这个算 */
+const FULL_BUILD = { alpha: 1, grow: 1 };
 
 interface FaceItem {
   mesh: THREE.Mesh;
@@ -113,6 +126,8 @@ interface FaceItem {
   edges: Set<string>;
   opacity: number;
   dim: boolean;
+  /** 入场构建的透明度系数（1=已完成；视频以外的场景恒为 1） */
+  buildAlpha: number;
 }
 
 function edgeKey(a: string, b: string): string {
@@ -131,6 +146,8 @@ interface CurvePiece {
   line: THREE.Line;
   solidMat: THREE.LineBasicMaterial;
   dashedMat: THREE.LineDashedMaterial;
+  /** 原本的颜色：高亮换色之后要能还回去 */
+  baseColor: number;
 }
 
 /** 一个解析好的截面：交线采样 + 每点法线（three 坐标），fill 是截面填充 */
@@ -149,6 +166,8 @@ interface SectionItem {
   color: THREE.Color;
   /** 这一步没讲到它 → 压暗 */
   dim: boolean;
+  /** 入场构建的透明度系数（1=已完成） */
+  buildAlpha: number;
 }
 
 export class Scene3DRenderer {
@@ -207,6 +226,15 @@ export class Scene3DRenderer {
   private stepHidden = new Set<string>();
   private stepIndex = -1;
 
+  // ---- 入场构建动画（视频专用）----
+  //
+  // 主画布从不开启，所以这里恒为空表，所有渲染行为与以前完全一致。
+  // 视频打开时由 videoStudio 驱动：棱按 grow 从起点长到终点，点按 alpha 由小放大，
+  // 面/截面/曲面按 alpha 淡入。为什么不用 drawRange 做棱的生长？因为一条棱只有
+  // 两个顶点，drawRange 只能"有或没有"，做不到中间状态；直接改写终点坐标最稳。
+  private buildOn = false;
+  private buildMap = new Map<string, { alpha: number; grow: number }>();
+
   // ---- 步骤运镜（视频化讲解 阶段①）----
   // 切换步骤时相机不瞬移，而是在 tickCameraTween 里逐帧插值。
   // 只动 target（看向哪里）和 distance（多远），不动方位角/仰角——
@@ -223,11 +251,35 @@ export class Scene3DRenderer {
   private data: Scene3D | null = null;
   private params: Record<string, number> = {};
 
+  /**
+   * 讲解视频的"红笔标注"层：本句的角度弧/直角方块/长度记号。
+   * 只在本句显示——切句即整组清掉重画，不累积留痕
+   * （3D 视角在慢转，多组标注叠在一起既乱又互相挡）。
+   */
+  private annGroup = new THREE.Group();
+
   /** 相机球坐标（度 / 世界单位）*/
   private azimuth = 35;
   private elevation = 18;
   private distance = 10;
   private target = new THREE.Vector3();
+
+  /**
+   * 视频板块专用：自动旋转周期（秒/圈）。0 = 不转。
+   * 主画布永远是 0（视野纹丝不动）；讲解视频设成 40 秒一圈，
+   * 让"这是个立体图"这件事自己交代清楚，而不靠忽远忽近的运镜。
+   */
+  autoRotateSeconds = 0;
+  /** 非重点对象的压暗倍数（1 = 不压暗）。主画布 0.22，视频里调高让立体图别消失 */
+  dimFactor = 0.22;
+  private lastFrameTime = 0;
+
+  /**
+   * 取景松紧（1 = 默认）。讲解视频的画布是 16:9，比主画布更宽，
+   * 按原来的距离取景图形会缩成中间一小块，静止不动的画面上尤其显空，
+   * 所以视频板块会把它调小一点（相机拉近），主画布保持 1 不变。
+   */
+  frameScale = 1;
 
   /** 场景包围球半径，缩放上下限与标签尺寸都以它为基准 */
   private radius = 1;
@@ -277,6 +329,9 @@ export class Scene3DRenderer {
     this.scene.add(this.contentGroup);
     this.scene.add(this.labelGroup);
     this.scene.add(this.axisGroup);
+    // 标注独立成层：不进 contentGroup（setScene 的 clearContent 会整组清掉），
+    // 由 setAnnotations3D 自己管理生命周期
+    this.scene.add(this.annGroup);
 
     this.bindPointer();
 
@@ -286,7 +341,12 @@ export class Scene3DRenderer {
 
     const loop = () => {
       this.raf = requestAnimationFrame(loop);
-      if (!this.active) return;
+      if (!this.active) {
+        // 挂起时清掉时间戳：再唤醒时不会因为"停了很久"而一次转过一大截
+        this.lastFrameTime = 0;
+        return;
+      }
+      this.tickAutoRotate(performance.now());
       this.tickCameraTween();
       if (this.dirty) {
         this.dirty = false;
@@ -361,6 +421,166 @@ export class Scene3DRenderer {
    *  讲解视频板块的渲染器可以打开。 */
   stepFlyEnabled = true;
 
+  /**
+   * 视频分镜模式：显隐/高亮由播放器逐句给，不再从 steps 推。
+   * 一条 step 的 highlight 是整步粒度，而讲解视频要"说到哪亮到哪"，
+   * steps 里没有这个粒度，所以由播放器算好集合传进来。
+   * null = 普通步骤模式（主画布走这条，互不干扰）。
+   */
+  private focusOverride: {
+    progressive: Set<string>;
+    revealed: Set<string>;
+    highlight: Set<string>;
+  } | null = null;
+
+  /** 当前"在讲的重点"——运镜飞向它；分镜模式每句更新 */
+  private activeHighlight: string[] = [];
+
+  /** 本句重点的 id 集合（棱/点的染色按它判断，避免在循环里反复 new Set） */
+  private hlSet = new Set<string>();
+
+  /**
+   * 高亮要不要把棱染成暖橙。默认 false = 主画布保持原样（只压淡别的），
+   * 视频板块打开它，让静止的画面上有明确指向。
+   */
+  accentHighlight = false;
+
+  /** 视频分镜用：按「本句高亮 / 已出现 / 会被渐进揭示的全集」渲染 */
+  applyFocus(highlight: string[], revealed: string[], progressive: string[]) {
+    this.focusOverride = {
+      highlight: new Set(highlight),
+      revealed: new Set(revealed),
+      progressive: new Set(progressive),
+    };
+    this.applyStep();
+    // 3D 是按需渲染（dirty 才画一帧）：高亮变了必须标脏，否则要等下一次转视角才刷新
+    this.dirty = true;
+  }
+
+  /** 退出分镜模式，回到 steps 驱动 */
+  clearFocus() {
+    this.focusOverride = null;
+    this.clearAnnotations();
+    this.applyStep();
+    this.dirty = true;
+  }
+
+  /**
+   * 设置本句的空间标注（讲解视频专用）。传空数组 = 清空。
+   *
+   * 线一律暖橙 + depthTest:false——标注是"讲课用红笔添上去的记号"，
+   * 被棱面挡住就没意义了；文字沿用标签精灵（Sprite 天然面向相机）。
+   * 与 2D 的 setAnnotations 同一套语义：播放器每句算好传进来，渲染器只管画。
+   */
+  setAnnotations3D(marks: AnnotationMark3D[]) {
+    this.clearAnnotations();
+    for (const mark of marks) {
+      for (const pl of mark.polylines) {
+        if (pl.length < 2) continue;
+        const geo = new THREE.BufferGeometry().setFromPoints(pl.map(toV3));
+        const mat = new THREE.LineBasicMaterial({
+          color: HL_COLOR,
+          depthTest: false,
+          transparent: true,
+        });
+        const line = new THREE.Line(geo, mat);
+        line.renderOrder = 9; // 压在棱/面之上、顶点标签之下
+        this.annGroup.add(line);
+      }
+      if (mark.text && mark.at) {
+        const s = this.makeLabel(mark.text, ANN_TEXT);
+        s.position.copy(toV3(mark.at));
+        this.annGroup.add(s);
+      }
+    }
+    this.dirty = true;
+  }
+
+  /** 清空标注层并释放几何/材质（Group 移除后 GPU 资源不会自动回收） */
+  private clearAnnotations() {
+    for (const child of [...this.annGroup.children]) {
+      this.annGroup.remove(child);
+      const any = child as unknown as {
+        geometry?: { dispose(): void };
+        material?: { dispose(): void };
+      };
+      any.geometry?.dispose();
+      any.material?.dispose();
+    }
+  }
+
+  /**
+   * 开启/关闭入场构建动画。关闭时立即恢复成完整图形。
+   *
+   * 只有视频工作台会开启；主画布保持关闭 → 打开页面就是完整立体图，
+   * 不会出现"每次换题都先空一下再长出来"的干扰。
+   */
+  setBuildEnabled(on: boolean) {
+    this.buildOn = on;
+    if (!on) {
+      this.buildMap.clear();
+      // 透明度与几何都要归位，否则关掉动画会留下半截棱
+      for (const e of this.edges) this.rewriteEdge(e, 1);
+      for (const [, mesh] of this.pointMeshById) mesh.scale.setScalar(1);
+      for (const l of this.labels) l.sprite.visible = true;
+      for (const f of this.faces) f.buildAlpha = 1;
+      for (const s of this.sections) s.buildAlpha = 1;
+    }
+    this.dirty = true;
+  }
+
+  /**
+   * 设置各对象的构建进度。
+   *
+   * entries 里没有列出的对象视为"已完成"——调用方只需要关心正在长的那几个。
+   * alpha：0=完全透明，1=正常；grow：棱从起点长到多长（0~1）。
+   */
+  setBuildProgress(entries: Array<{ id: string; alpha: number; grow: number }>) {
+    this.buildMap.clear();
+    for (const e of entries) this.buildMap.set(e.id, { alpha: e.alpha, grow: e.grow });
+
+    for (const e of this.edges) this.rewriteEdge(e, this.buildOf(e.id).grow);
+    // 点：小球从 0 放大（不碰透明度，避免和"压暗"逻辑打架）
+    for (const [id, mesh] of this.pointMeshById) {
+      const a = this.buildOf(id).alpha;
+      mesh.scale.setScalar(Math.max(0.001, a));
+    }
+    // 标签：太小的时候先不显示，否则字母先在空处飘着
+    for (const l of this.labels) l.sprite.visible = this.buildOf(l.id).alpha > 0.35;
+    // 面 / 截面 / 旋转体：透明度在各自的逐帧函数里相乘
+    for (const f of this.faces) f.buildAlpha = this.buildOf(f.id).alpha;
+    for (const s of this.sections) s.buildAlpha = this.buildOf(s.id).alpha;
+    this.dirty = true;
+  }
+
+  private buildOf(id: string): { alpha: number; grow: number } {
+    return this.buildMap.get(id) ?? FULL_BUILD;
+  }
+
+  /** 把一条棱画成"从 a 出发已走 t 比例"的样子（t=1 即整条） */
+  private rewriteEdge(e: EdgeItem, t: number) {
+    const pa = this.points.get(e.a);
+    const pb = this.points.get(e.b);
+    if (!pa || !pb) return;
+    const k = Math.max(0.001, Math.min(1, t));
+    const end: Vec3 = [
+      pa[0] + (pb[0] - pa[0]) * k,
+      pa[1] + (pb[1] - pa[1]) * k,
+      pa[2] + (pb[2] - pa[2]) * k,
+    ];
+    (e.line.geometry as THREE.BufferGeometry).setFromPoints([toV3(pa), toV3(end)]);
+    // 虚线的 dash 距离依赖顶点位置，改完必须重算
+    if (e.dashedNow) e.line.computeLineDistances();
+  }
+
+  /**
+   * 视频分镜：镜头飞到当前这一句的重点对象。
+   * 短补间（默认 420ms）——一句话只有几秒，运镜要跟手。
+   */
+  flyToActive(duration = 420) {
+    this.flyToHighlight(duration);
+  }
+
   setStep(index: number) {
     this.stepIndex = index;
     this.applyStep();
@@ -373,11 +593,10 @@ export class Scene3DRenderer {
    * 相机平滑飞到"正对包围盒中心、距离按包围盒大小定"的位置。
    * 没写 highlight 的步骤不动相机——没有重点时乱飞只会添乱。
    */
-  private flyToHighlight() {
-    const steps = this.data?.steps;
-    if (!steps || this.stepIndex < 0) return;
-    const idx = Math.min(this.stepIndex, steps.length - 1);
-    const highlighted = steps[idx].highlight ?? [];
+  private flyToHighlight(duration = 700) {
+    // 飞向"当前在讲的重点"：普通步骤模式由 applyStep 从 steps 取，
+    // 分镜模式由 applyFocus 逐句更新——共用同一条运镜
+    const highlighted = this.activeHighlight;
     if (highlighted.length === 0) return;
 
     // 汇总所有高亮、且当前可见对象的包围盒
@@ -408,7 +627,7 @@ export class Scene3DRenderer {
       fromDist: this.distance,
       toDist,
       start: performance.now(),
-      duration: 700,
+      duration,
     };
     this.dirty = true;
   }
@@ -426,6 +645,28 @@ export class Scene3DRenderer {
     if (k >= 1) this.camTween = null;
   }
 
+  /**
+   * 每帧推进自转。
+   * 用"实际经过的时间"换算角度（而不是每帧加固定角度），
+   * 这样 120Hz 屏和 60Hz 屏转得一样快；单帧超过 100ms 的卡顿会被截断，
+   * 免得一次跳过大半圈看起来像瞬移。
+   */
+  private tickAutoRotate(now: number) {
+    if (this.autoRotateSeconds <= 0 || this.dragging) {
+      this.lastFrameTime = now;
+      return;
+    }
+    if (this.lastFrameTime === 0) {
+      this.lastFrameTime = now;
+      return;
+    }
+    const dt = Math.min((now - this.lastFrameTime) / 1000, 0.1);
+    this.lastFrameTime = now;
+    this.azimuth = (this.azimuth + (360 / this.autoRotateSeconds) * dt) % 360;
+    this.dirty = true;
+    this.onViewChange?.(this.azimuth, this.elevation);
+  }
+
   /** 把对象挂到 id 名下：一个 id 可能对应多个 three 对象，所以存数组 */
   private register(id: string, obj: THREE.Object3D) {
     const list = this.idObjects.get(id);
@@ -434,11 +675,24 @@ export class Scene3DRenderer {
   }
 
   private applyStep() {
-    const steps = this.data?.steps;
     this.dirty = true;
+
+    // 分镜模式优先：显隐与高亮全部由播放器逐句给（讲解视频走这条）
+    if (this.focusOverride) {
+      this.applyFocusSets(
+        this.focusOverride.progressive,
+        this.focusOverride.revealed,
+        this.focusOverride.highlight,
+      );
+      return;
+    }
+
+    const steps = this.data?.steps;
 
     // 无步骤模式：全部显示、全部正常
     if (!steps || steps.length === 0 || this.stepIndex < 0) {
+      this.activeHighlight = [];
+      this.hlSet.clear();
       this.stepHidden.clear();
       for (const objs of this.idObjects.values()) for (const o of objs) o.visible = true;
       for (const e of this.edges) e.dim = false;
@@ -461,9 +715,23 @@ export class Scene3DRenderer {
     for (let i = 0; i <= idx; i++) {
       for (const id of steps[i].reveal ?? []) revealed.add(id);
     }
-    const highlighted = new Set(steps[idx].highlight ?? []);
-    // 这一步没写 highlight 时不压暗任何东西——否则整张图一起变淡，等于没有重点
+    this.applyFocusSets(progressive, revealed, new Set(steps[idx].highlight ?? []));
+  }
+
+  /**
+   * 按三个集合落显隐与压暗——3D 侧唯一的"重点"入口。
+   * 空 highlight 时不压暗任何对象：否则"这一步没写 highlight"会让整张图变灰，
+   * 等于没有重点（分镜模式下每句都可能在讲背景，这个保护更要紧）。
+   */
+  private applyFocusSets(
+    progressive: Set<string>,
+    revealed: Set<string>,
+    highlighted: Set<string>,
+  ) {
     const dimOthers = highlighted.size > 0;
+    this.activeHighlight = [...highlighted];
+    // 只有视频板块才染色；主画布的 hlSet 恒为空，等于"只压淡、不改色"
+    this.hlSet = this.accentHighlight ? new Set(highlighted) : new Set();
 
     for (const [id, objs] of this.idObjects) {
       const visible = progressive.has(id) ? revealed.has(id) : true;
@@ -485,18 +753,47 @@ export class Scene3DRenderer {
     for (const g of this.solidGeoms) g.dim = dimOthers && !highlighted.has(g.id);
     for (const s of this.sections) s.dim = dimOthers && !highlighted.has(s.id);
     for (const [id, mesh] of this.pointMeshById) {
-      this.setMatDim(mesh, dimOthers && !highlighted.has(id));
+      const hl = highlighted.has(id);
+      this.setMatDim(mesh, dimOthers && !hl, hl);
     }
     this.applyEdgeDimAll();
     this.applyLabelDim(dimOthers, highlighted);
   }
 
-  private setMatDim(mesh: THREE.Mesh, dim: boolean) {
+  /**
+   * 顶点小球的三态：正常 / 压暗 / 高亮（换暖橙）。
+   * 与 2D 的 setBucketState 同一套语义，只是一次只处理一个网格。
+   */
+  private setMatDim(mesh: THREE.Mesh, dim: boolean, hl = false) {
     const m = mesh.material as THREE.MeshBasicMaterial;
     if (!m) return;
+    if (m.userData.__baseColor === undefined) {
+      m.userData.__baseColor = m.color.getHex();
+    }
+    m.color.setHex(hl ? HL_COLOR : (m.userData.__baseColor as number));
     m.transparent = dim;
-    m.opacity = dim ? 0.22 : 1;
+    m.opacity = dim ? this.dimFactor : 1;
     m.needsUpdate = true;
+  }
+
+  /** 棱的颜色：本步重点是暖橙，其余按原色。
+   * 3D 这边只换色不加粗——用 TubeGeometry 给每条棱做粗管成本太高，
+   * 而且棱的虚实每帧都在重算，粗细一改就要重建几何，得不偿失。
+   */
+  private applyEdgeDimAll() {
+    for (const e of this.edges) {
+      const hl = this.hlSet.has(e.id);
+      const pairs: Array<[THREE.LineBasicMaterial, number]> = [
+        [e.solidMat, e.baseColor],
+        [e.dashedMat, e.baseHiddenColor],
+      ];
+      for (const [m, base] of pairs) {
+        m.transparent = e.dim;
+        m.opacity = e.dim ? this.dimFactor : 1;
+        m.color.setHex(hl ? HL_COLOR : base);
+        m.needsUpdate = true;
+      }
+    }
   }
 
   /** 标签的压暗：字母不跟着变淡的话，被压暗的顶点旁边会挂着一个醒目的黑字 */
@@ -507,16 +804,6 @@ export class Scene3DRenderer {
       m.transparent = true;
       m.opacity = dimOthers && !highlighted.has(l.id) ? 0.28 : 1;
       m.needsUpdate = true;
-    }
-  }
-
-  private applyEdgeDimAll() {
-    for (const e of this.edges) {
-      for (const m of [e.solidMat, e.dashedMat]) {
-        m.transparent = e.dim;
-        m.opacity = e.dim ? 0.22 : 1;
-        m.needsUpdate = true;
-      }
     }
   }
 
@@ -615,7 +902,7 @@ export class Scene3DRenderer {
     for (let i = 0; i < obj.points.length; i++) {
       edges.add(edgeKey(obj.points[i], obj.points[(i + 1) % obj.points.length]));
     }
-    this.faces.push({ mesh, mat, id: obj.id, center, edges, opacity, dim: false });
+    this.faces.push({ mesh, mat, id: obj.id, center, edges, opacity, dim: false, buildAlpha: 1 });
   }
 
   private buildEdge(obj: Edge3Object) {
@@ -644,6 +931,8 @@ export class Scene3DRenderer {
       forced: obj.dashed,
       dashedNow: false,
       dim: false,
+      baseColor: solidMat.color.getHex(),
+      baseHiddenColor: dashedMat.color.getHex(),
     };
     this.edges.push(item);
     this.register(obj.id, line);
@@ -849,6 +1138,7 @@ export class Scene3DRenderer {
         opacity: obj.opacity ?? 0.14,
         color,
         dim: false,
+        buildAlpha: 1,
       });
     }
   }
@@ -947,7 +1237,12 @@ export class Scene3DRenderer {
     // 几何每帧换，包围球会过期，交给 three 剔除会被误剔掉
     line.frustumCulled = false;
     this.contentGroup.add(line);
-    const piece: CurvePiece = { line, solidMat, dashedMat };
+    const piece: CurvePiece = {
+      line,
+      solidMat,
+      dashedMat,
+      baseColor: color.getHex(),
+    };
     list.push(piece);
     return piece;
   }
@@ -987,11 +1282,15 @@ export class Scene3DRenderer {
       }
       for (let i = runs.length; i < list.length; i++) list[i].line.visible = false;
 
-      // 压暗：和棱的处理一致（这一步没讲到它就变淡）
+      // 压暗：和棱的处理一致（这一步没讲到它就变淡）；讲到它就把轮廓染成重点色
+      const hl = this.hlSet.has(g.id);
+      // 入场构建：曲面体（圆柱/圆锥/球）整体淡入，避免"球先在那儿、截面后画"的错位
+      const buildA = this.buildOf(g.id).alpha;
       for (const p of list) {
         for (const m of [p.solidMat, p.dashedMat]) {
-          m.transparent = g.dim === true;
-          m.opacity = g.dim ? 0.22 : 1;
+          m.transparent = g.dim === true || buildA < 1;
+          m.opacity = (g.dim ? this.dimFactor : 1) * buildA;
+          m.color.setHex(hl ? HL_COLOR : p.baseColor);
           m.needsUpdate = true;
         }
       }
@@ -999,7 +1298,8 @@ export class Scene3DRenderer {
       const fill = this.curvedFills.get(g.id);
       if (fill) {
         for (const [i, m] of fill.mats.entries()) {
-          m.opacity = g.opacity * (g.dim ? 0.3 : 1);
+          m.transparent = true;
+          m.opacity = g.opacity * (g.dim ? 0.3 : 1) * buildA;
           fill.meshes[i].visible = !hidden;
         }
       }
@@ -1041,15 +1341,17 @@ export class Scene3DRenderer {
       }
       for (let i = runs.length; i < list.length; i++) list[i].line.visible = false;
 
-      // 压暗：交线和平面一起淡
+      // 压暗：交线和平面一起淡；讲到截面时交线染成重点色
+      const hl = this.hlSet.has(s.id);
       for (const p of list) {
         for (const m of [p.solidMat, p.dashedMat]) {
-          m.transparent = s.dim;
-          m.opacity = s.dim ? 0.22 : 1;
+          m.transparent = s.dim || s.buildAlpha < 1;
+          m.opacity = (s.dim ? this.dimFactor : 1) * s.buildAlpha;
+          m.color.setHex(hl ? HL_COLOR : p.baseColor);
           m.needsUpdate = true;
         }
       }
-      s.mat.opacity = s.opacity * (s.dim ? 0.3 : 1);
+      s.mat.opacity = s.opacity * (s.dim ? 0.3 : 1) * s.buildAlpha;
     }
   }
 
@@ -1336,7 +1638,8 @@ export class Scene3DRenderer {
       this.camera.fov = fov;
       // 让半径为 r 的球刚好占满画面高度的 ~75%
       const need = (maxR / Math.sin((fov * Math.PI) / 360)) * 1.35;
-      this.distance = cam?.distance ?? Math.max(need, maxR * 1.6);
+      this.distance =
+        cam?.distance ?? Math.max(need, maxR * 1.6) * this.frameScale;
     }
     this.camera.near = Math.max(0.01, this.distance * 0.02);
     this.camera.far = this.distance * 20;
@@ -1344,10 +1647,24 @@ export class Scene3DRenderer {
     this.dirty = true;
   }
 
+  /** 播放器专用推近倍率（1 = 原样）；乘在相机距离上，不改 target/角度 */
+  private zoomScale = 1;
+
+  /**
+   * 设置推近倍率。讲解视频在一步之内从 1.00 缓慢推到 1.06 制造"呼吸感"；
+   * 主画布不调用，视野保持固定。
+   */
+  setZoomScale(scale: number) {
+    const s = Math.max(0.6, Math.min(2, scale));
+    if (Math.abs(s - this.zoomScale) < 0.0005) return;
+    this.zoomScale = s;
+    this.dirty = true;
+  }
+
   private updateCamera() {
     const az = (this.azimuth * Math.PI) / 180;
     const el = (this.elevation * Math.PI) / 180;
-    const d = this.distance;
+    const d = this.distance / this.zoomScale;
     this.camera.position.set(
       this.target.x + d * Math.cos(el) * Math.sin(az),
       this.target.y + d * Math.sin(el),
@@ -1389,7 +1706,7 @@ export class Scene3DRenderer {
       // 直接写 visible = front 会把 applyStep 设的显隐冲掉，
       // 所以两个条件在这里合并。
       const base = front ? f.opacity : f.opacity * 0.25;
-      f.mat.opacity = base * (f.dim ? 0.3 : 1);
+      f.mat.opacity = base * (f.dim ? 0.3 : 1) * f.buildAlpha;
       f.mesh.visible = front && !this.stepHidden.has(f.id);
       return front;
     });
@@ -1516,6 +1833,7 @@ export class Scene3DRenderer {
     };
     disposeGroup(this.contentGroup);
     disposeGroup(this.labelGroup);
+    this.clearAnnotations();
     this.axesClear();
     this.points.clear();
     this.edges = [];

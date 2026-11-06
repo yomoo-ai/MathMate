@@ -30,6 +30,13 @@ import type {
 } from '../protocol/scene';
 import { evalNumber, evalVec2 } from '../protocol/expr';
 import { makeTextSprite } from './textSprite';
+import type { AnnotationMark } from './annotations';
+
+/** 视频讲解的"重点色"：暖橙。高亮的边、角、标注都用它，和界面主色一致 */
+const ACCENT = 0xea580c;
+const ACCENT_CSS = '#c2410c';
+/** 覆盖层的 z：压在对象层之上，与标注层错开一点（正交相机下只是渲染顺序的保险） */
+const OVERLAY_Z = 0.8;
 
 const COLORS = {
   grid: 0xd8d5cc,
@@ -51,6 +58,49 @@ interface DragUserData {
   constraint?: { type: 'circle'; center: [number, number]; radius: number };
 }
 
+/**
+ * 一条"正在演出来"的覆盖图形。
+ *
+ * progress 是这条线目前画了百分之几：0 = 还没动笔，1 = 画完。
+ * 渲染器按折线弧长截断，于是"作辅助线"真的看起来像有人从 A 画到 B，
+ * 角度弧也会像圆规一样一点点扫出来。
+ */
+export interface OverlayShape {
+  /** 稳定标识：同一动作在每一帧都用同一个 key，渲染器才能复用几何体 */
+  key: string;
+  /** 世界坐标折线 */
+  points: Array<[number, number]>;
+  /** 0~1：按弧长截断到百分之几 */
+  progress: number;
+  /** 可选文字（度数、长度） */
+  text?: string;
+  textAt?: [number, number];
+  /** 文字淡入进度（0~1），不传按 progress 算 */
+  textProgress?: number;
+  /** 颜色，默认暖橙 */
+  color?: string | number;
+  dashed?: boolean;
+  /** 整体透明度（旧句留下的记号压到 0.45，让当前句仍是视觉中心） */
+  opacity?: number;
+  /**
+   * 大于 0 时改用"面片"画（宽度为世界单位）。
+   * 为什么需要：WebGL 在 Windows 上忽略 linewidth，线永远 1 像素；
+   * 辅助线是讲解的主线，1 像素在投影上看不清，只能拿一圈面片冒充粗线。
+   */
+  width?: number;
+}
+
+interface OverlayItem {
+  obj: THREE.Object3D;
+  geo: THREE.BufferGeometry;
+  mat: THREE.LineBasicMaterial | THREE.MeshBasicMaterial;
+  /** 顶点容量（点数），不够时扩容一次 */
+  capacity: number;
+  sprite?: THREE.Sprite;
+  spriteText?: string;
+  ribbon: boolean;
+}
+
 export class SceneRenderer {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
@@ -59,6 +109,27 @@ export class SceneRenderer {
   private objectGroup = new THREE.Group();
   /** 网格/坐标轴层：随视图范围重建 */
   private gridGroup = new THREE.Group();
+  /**
+   * 标注层（视频讲解用）。
+   * 单独一层而不是塞进对象桶：标注是"讲到才出现"的临时记号，
+   * 与场景对象生命周期不同，混在一起会在 rebuild 时被一起清掉。
+   */
+  private annotationGroup = new THREE.Group();
+  /** 当前要显示的标注（rebuild 之后要能照原样重画——缩放/改参数都会重建） */
+  private pendingAnnotations: AnnotationMark[] = [];
+  /**
+   * 逐帧覆盖层（讲解视频专用）：辅助线的"生长"、角度弧的"扫出"、
+   * 板书里的动态记号都画在这一层。
+   *
+   * 为什么不复用 annotationGroup：标注是"整条一起出现"的静态记号，
+   * 而这层每一帧都在变长度——两者的生命周期和更新频率完全不同，
+   * 混在一起会导致每帧重建整个标注层（文字贴图重建非常贵）。
+   */
+  private overlayGroup = new THREE.Group();
+  private pendingOverlay: OverlayShape[] = [];
+  private overlayItems = new Map<string, OverlayItem>();
+  /** 覆盖层文字的相对字号（主画布 1，视频板块会调大一点） */
+  overlayTextScale = 1;
   private container: HTMLElement;
 
   private currentScene: Scene | null = null;
@@ -92,7 +163,7 @@ export class SceneRenderer {
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
     this.camera.position.z = 10;
 
-    this.scene.add(this.gridGroup, this.objectGroup);
+    this.scene.add(this.gridGroup, this.objectGroup, this.annotationGroup, this.overlayGroup);
 
     const el = this.renderer.domElement;
     el.style.cursor = 'crosshair';
@@ -148,6 +219,7 @@ export class SceneRenderer {
     this.camTween = null;
     this.disposeGroup(this.objectGroup);
     this.disposeGroup(this.gridGroup);
+    this.disposeGroup(this.annotationGroup);
     this.pickables = [];
     this.idGroups.clear();
     this.contentPts = [];
@@ -176,6 +248,8 @@ export class SceneRenderer {
     this.autoFitView();
 
     this.applyStep();
+    // 标注按世界坐标画，视野/尺寸变了要按新比例重画一遍（否则弧会变形、字号会不对）
+    this.drawAnnotations();
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -272,6 +346,329 @@ export class SceneRenderer {
    *  讲解视频板块的渲染器可以打开，视频里运镜是加分项。 */
   stepFlyEnabled = true;
 
+  /**
+   * 视频分镜模式：显隐/高亮不再从 steps 推，而是由播放器按"当前这一句"直接给。
+   *
+   * 为什么需要：一条 step 的 highlight 是整步的，而讲解视频要一句话一个重点
+   * （说到交线才亮交线、说到辅助线才让它长出来）。steps 里没有这个粒度，
+   * 所以由播放器逐句算好集合传进来，渲染器只负责照着画。
+   * null = 普通步骤模式（主画布永远走这条路，互不干扰）。
+   */
+  private focusOverride: {
+    progressive: Set<string>;
+    revealed: Set<string>;
+    highlight: Set<string>;
+  } | null = null;
+
+  /** 当前"在讲的重点"——运镜要飞向它；分镜模式每句都会更新 */
+  private activeHighlight: string[] = [];
+
+  /**
+   * 高亮要不要"加色加粗"（暖橙 + 面片描边）。
+   *
+   * 默认 false：主画布保持原来的样子——只把别的对象压淡，重点本身不改色。
+   * 讲解视频会打开它：那个画布镜头完全不动，没有颜色和粗细的差别就
+   * 根本看不出在讲哪条边。
+   */
+  accentHighlight = false;
+
+  /**
+   * 非重点对象的压暗倍数（1 = 完全不压暗，0.25 = 只留四分之一）。
+   * 主画布沿用 0.25 的老观感；视频里要"图一直在黑板上"，
+   * 压到 0.25 会让整张图看起来每句都在消失，所以调高到 0.6。
+   */
+  dimFactor = 0.25;
+
+  /**
+   * 视频分镜用：按「本句高亮 / 已经出现的对象 / 会被渐进揭示的全集」渲染。
+   * 与 setStep 并存，互不覆盖。
+   */
+  applyFocus(highlight: string[], revealed: string[], progressive: string[]) {
+    this.focusOverride = {
+      highlight: new Set(highlight),
+      revealed: new Set(revealed),
+      progressive: new Set(progressive),
+    };
+    this.applyStep();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /** 退出分镜模式，回到 steps 驱动（视频停止播放时调用） */
+  clearFocus() {
+    this.focusOverride = null;
+    this.pendingAnnotations = [];
+    this.disposeGroup(this.annotationGroup);
+    this.applyStep();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * 设置当前要显示的标注（视频讲解专用）。
+   * 传空数组 = 清空。由播放器每句算好传进来，渲染器只管画。
+   */
+  setAnnotations(marks: AnnotationMark[]) {
+    this.pendingAnnotations = marks;
+    this.disposeGroup(this.annotationGroup);
+    this.drawAnnotations();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * 把标注画出来：折线用暖橙细线（角度弧 / 直角方块 / 等长刻度），
+   * 文字用精灵贴在指定位置。
+   *
+   * depthTest 一律关掉：标注是"讲课时用红笔添上去的记号"，
+   * 被别的线挡住就没意义了。
+   */
+  private drawAnnotations() {
+    if (this.pendingAnnotations.length === 0) return;
+    const z = 0.6; // 压在对象上方
+    const textH = this.labelH() * 0.95;
+
+    for (const mark of this.pendingAnnotations) {
+      for (const line of mark.polylines) {
+        if (line.length < 2) continue;
+        const geo = new THREE.BufferGeometry().setFromPoints(
+          line.map(([x, y]) => new THREE.Vector3(x, y, z)),
+        );
+        const mat = new THREE.LineBasicMaterial({
+          color: ACCENT,
+          depthTest: false,
+          transparent: true,
+        });
+        const l = new THREE.Line(geo, mat);
+        l.renderOrder = 10;
+        this.annotationGroup.add(l);
+      }
+      if (mark.text && mark.at) {
+        const s = makeTextSprite(mark.text, {
+          worldHeight: textH,
+          color: ACCENT_CSS,
+        });
+        s.position.set(mark.at[0], mark.at[1], z + 0.05);
+        s.renderOrder = 11;
+        this.annotationGroup.add(s);
+      }
+    }
+  }
+
+
+  // ---------------------------------------------------------------
+  // 逐帧覆盖层：辅助线生长、角度弧扫出、动态记号
+  // ---------------------------------------------------------------
+
+  /**
+   * 设置这一帧要显示的覆盖图形。播放器每帧调用一次（约 60 次/秒）。
+   *
+   * 性能上做的是"增量更新"而不是"清空重建"：
+   * 同一个 key 的图形复用同一个 BufferGeometry，只改顶点和 drawRange。
+   * 如果每帧新建几何体，60fps 下几秒钟就会堆出上千个 BufferGeometry，
+   * 显存和 GC 都扛不住（第一版就是这么写的，播放十秒后明显掉帧）。
+   */
+  setOverlay(shapes: OverlayShape[]) {
+    this.pendingOverlay = shapes;
+    this.drawOverlay();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /** 清空覆盖层（暂停/退出视频时调用） */
+  clearOverlay() {
+    this.pendingOverlay = [];
+    this.drawOverlay();
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  private drawOverlay() {
+    const seen = new Set<string>();
+    for (const shape of this.pendingOverlay) {
+      if (shape.points.length < 2) continue;
+      seen.add(shape.key);
+      let item = this.overlayItems.get(shape.key);
+      if (!item) {
+        item = this.createOverlayItem(shape);
+        this.overlayItems.set(shape.key, item);
+        this.overlayGroup.add(item.obj);
+      }
+      this.updateOverlayItem(item, shape);
+    }
+    // 这一帧没出现的图形 = 动作已经演完并被移出（或整句切走了），回收掉
+    for (const [key, item] of Array.from(this.overlayItems)) {
+      if (seen.has(key)) continue;
+      this.overlayGroup.remove(item.obj);
+      this.disposeOverlayItem(item);
+      this.overlayItems.delete(key);
+    }
+  }
+
+  private createOverlayItem(shape: OverlayShape): OverlayItem {
+    const ribbon = (shape.width ?? 0) > 0;
+    const capacity = 512;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array(capacity * 3), 3),
+    );
+
+    const color = new THREE.Color(shape.color ?? ACCENT);
+    let mat: THREE.LineBasicMaterial | THREE.MeshBasicMaterial;
+    let obj: THREE.Object3D;
+
+    if (ribbon) {
+      mat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        depthTest: false,
+        side: THREE.DoubleSide,
+      });
+      obj = new THREE.Mesh(geo, mat);
+    } else if (shape.dashed) {
+      mat = new THREE.LineDashedMaterial({
+        color,
+        dashSize: 0.16,
+        gapSize: 0.11,
+        transparent: true,
+        depthTest: false,
+      });
+      obj = new THREE.Line(geo, mat);
+    } else {
+      mat = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        depthTest: false,
+      });
+      obj = new THREE.Line(geo, mat);
+    }
+    obj.renderOrder = 12;
+    return { obj, geo, mat, capacity, ribbon };
+  }
+
+  private updateOverlayItem(item: OverlayItem, shape: OverlayShape) {
+    const pts = trimPolyline(shape.points, shape.progress);
+    const count = item.ribbon
+      ? this.writeRibbon(item, pts, shape.width ?? 0.05)
+      : this.writeLine(item, pts);
+
+    item.geo.setDrawRange(0, count);
+    const attr = item.geo.getAttribute('position') as THREE.BufferAttribute;
+    attr.needsUpdate = true;
+    // 顶点每帧都在变，包围盒算出来也没有意义；直接关掉视锥剔除省掉这份开销
+    item.obj.frustumCulled = false;
+    (item.mat as THREE.LineBasicMaterial).color.set(shape.color ?? ACCENT);
+    const baseOpacity = shape.opacity ?? 1;
+    item.mat.transparent = baseOpacity < 1;
+    item.mat.opacity = baseOpacity;
+    item.obj.visible = count > 0;
+
+    if (shape.dashed && item.obj instanceof THREE.Line) {
+      item.obj.computeLineDistances();
+    }
+
+    // ---- 文字：度数/长度，跟着图形一起淡入 ----
+    if (shape.text && shape.textAt) {
+      const op = shape.textProgress ?? Math.max(0, (shape.progress - 0.55) / 0.45);
+      if (!item.sprite || item.spriteText !== shape.text) {
+        if (item.sprite) {
+          item.obj.remove(item.sprite);
+          this.disposeMaterial(item.sprite.material as THREE.Material);
+        }
+        const s = makeTextSprite(shape.text, {
+          // 视频里经常全屏看，字要比主画布再大一点才读得清
+          worldHeight: this.labelH() * 0.95 * this.overlayTextScale,
+          color: ACCENT_CSS,
+        });
+        s.renderOrder = 13;
+        item.obj.add(s);
+        item.sprite = s;
+        item.spriteText = shape.text;
+      }
+      const sp = item.sprite;
+      // 精灵是 obj 的子对象：obj 已经整体画在 OVERLAY_Z 上，这里只补一点相对高度，
+      // 保证文字压在自己的线上方
+      const at = this.clampToView(shape.textAt);
+      sp.position.set(at[0], at[1], 0.02);
+      const sm = sp.material as THREE.SpriteMaterial;
+      sm.opacity = Math.min(1, Math.max(0, op)) * baseOpacity;
+      sm.transparent = true;
+      sp.visible = sm.opacity > 0.02;
+    } else if (item.sprite) {
+      item.obj.remove(item.sprite);
+      this.disposeMaterial(item.sprite.material as THREE.Material);
+      item.sprite = undefined;
+      item.spriteText = undefined;
+    }
+  }
+
+  /**
+   * 把标注文字收进可视范围。
+   * 长度标签默认挂在边的外侧，边正好贴着视野边缘时（比如底边就是 x 轴），
+   * 标签会被推到画面外——肉眼看就是"数字被切掉了"。留一点内边距再夹一次。
+   */
+  private clampToView(p: [number, number]): [number, number] {
+    const cam = this.camera;
+    const insetX = (cam.right - cam.left) * 0.03;
+    const insetY = (cam.top - cam.bottom) * 0.05;
+    return [
+      Math.min(cam.right - insetX, Math.max(cam.left + insetX, p[0])),
+      Math.min(cam.top - insetY, Math.max(cam.bottom + insetY, p[1])),
+    ];
+  }
+
+  /** 普通折线：直接写顶点 */
+  private writeLine(item: OverlayItem, pts: Array<[number, number]>): number {
+    const n = Math.min(pts.length, item.capacity);
+    const arr = (item.geo.getAttribute('position') as THREE.BufferAttribute)
+      .array as Float32Array;
+    for (let i = 0; i < n; i++) {
+      arr[i * 3] = pts[i][0];
+      arr[i * 3 + 1] = pts[i][1];
+      arr[i * 3 + 2] = OVERLAY_Z;
+    }
+    return n;
+  }
+
+  /** 面片折线：每段展开成一个四边形（两个三角形），用来冒充粗线 */
+  private writeRibbon(
+    item: OverlayItem,
+    pts: Array<[number, number]>,
+    width: number,
+  ): number {
+    const arr = (item.geo.getAttribute('position') as THREE.BufferAttribute)
+      .array as Float32Array;
+    const half = Math.max(width, 0.004) / 2;
+    let v = 0;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const [x0, y0] = pts[i];
+      const [x1, y1] = pts[i + 1];
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const l = Math.hypot(dx, dy);
+      if (l < 1e-9) continue;
+      const nx = (-dy / l) * half;
+      const ny = (dx / l) * half;
+      const quad: Array<[number, number]> = [
+        [x0 + nx, y0 + ny],
+        [x1 + nx, y1 + ny],
+        [x1 - nx, y1 - ny],
+        [x0 + nx, y0 + ny],
+        [x1 - nx, y1 - ny],
+        [x0 - nx, y0 - ny],
+      ];
+      for (const [px, py] of quad) {
+        if (v + 3 > arr.length) return v / 3;
+        arr[v++] = px;
+        arr[v++] = py;
+        arr[v++] = OVERLAY_Z;
+      }
+    }
+    return v / 3;
+  }
+
+  private disposeOverlayItem(item: OverlayItem) {
+    item.geo.dispose();
+    this.disposeMaterial(item.mat);
+    if (item.sprite) this.disposeMaterial(item.sprite.material as THREE.Material);
+  }
+
   /** 切换到第 index 步（0 起）；传入场景里没有 steps 时不生效 */
   setStep(index: number) {
     this.stepIndex = index;
@@ -286,11 +683,10 @@ export class SceneRenderer {
    * 相机（正交视野）从当前值平滑过渡到"包住包围盒再留 1.8 倍余量"。
    * 2D 渲染是按需渲染（无常驻帧循环），所以补间自带一个临时 rAF 小循环。
    */
-  private flyToHighlight() {
-    const steps = this.currentScene?.steps;
-    if (!steps || this.stepIndex < 0) return;
-    const idx = Math.min(this.stepIndex, steps.length - 1);
-    const highlighted = steps[idx].highlight ?? [];
+  private flyToHighlight(duration = 700) {
+    // 飞向"当前在讲的重点"：普通步骤模式由 applyStep 从 steps 里取，
+    // 分镜模式由 applyFocus 逐句更新——两种情况共用这一条运镜。
+    const highlighted = this.activeHighlight;
     if (highlighted.length === 0) return;
 
     const box = new THREE.Box3();
@@ -328,10 +724,18 @@ export class SceneRenderer {
           },
       to: { cx: center.x, cy: center.y, halfW, halfH },
       start: performance.now(),
-      duration: 700,
+      duration,
     };
     // 连续点步骤时先停掉上一段，从当前视野接着飞（不瞬移回起点）
     this.tickCameraTween();
+  }
+
+  /**
+   * 视频分镜：镜头飞到当前这一句的重点对象。
+   * 用短补间（默认 420ms）——一句话只有几秒，运镜必须"跟手"而不是"飘过去"。
+   */
+  flyToActive(duration = 420) {
+    this.flyToHighlight(duration);
   }
 
   /** 每帧推进 2D 运镜补间；easeInOutCubic 先加速后减速 */
@@ -357,12 +761,23 @@ export class SceneRenderer {
   }
 
   private applyStep() {
+    // 分镜模式优先：显隐与高亮全部由播放器逐句给（讲解视频走这条）
+    if (this.focusOverride) {
+      this.applyFocusSets(
+        this.focusOverride.progressive,
+        this.focusOverride.revealed,
+        this.focusOverride.highlight,
+      );
+      return;
+    }
+
     const steps = this.currentScene?.steps;
     if (!steps || steps.length === 0 || this.stepIndex < 0) {
       // 无步骤模式：全部显示、恢复默认透明度
+      this.activeHighlight = [];
       for (const g of this.idGroups.values()) {
         g.visible = true;
-        this.setBucketEmphasis(g, true);
+        this.setBucketState(g, 'normal');
       }
       return;
     }
@@ -378,17 +793,59 @@ export class SceneRenderer {
     for (let i = 0; i <= idx; i++) {
       for (const id of steps[i].reveal ?? []) revealed.add(id);
     }
-    const highlighted = new Set(steps[idx].highlight ?? []);
 
+    this.applyFocusSets(progressive, revealed, new Set(steps[idx].highlight ?? []));
+  }
+
+  /**
+   * 按三个集合落显隐与压暗——渲染器唯一的"重点"入口。
+   * 空 highlight 时不压暗任何对象：否则"这一步没写 highlight"会让整张图变灰，
+   * 等于没有重点（分镜模式下每句都可能在讲背景，这个保护更要紧）。
+   */
+  private applyFocusSets(
+    progressive: Set<string>,
+    revealed: Set<string>,
+    highlighted: Set<string>,
+  ) {
+    const dimOthers = highlighted.size > 0;
+    this.activeHighlight = [...highlighted];
     for (const [id, g] of this.idGroups) {
       g.visible = progressive.has(id) ? revealed.has(id) : true;
-      this.setBucketEmphasis(g, highlighted.has(id));
+      const state = !dimOthers
+        ? 'normal'
+        : !highlighted.has(id)
+          ? 'dim'
+          : this.accentHighlight
+            ? 'hl'
+            : 'normal';
+      this.setBucketState(g, state);
     }
   }
 
-  /** emphasized=true 正常显示；false 变淡（未被高亮的步骤背景） */
-  private setBucketEmphasis(g: THREE.Group, emphasized: boolean) {
+/**
+   * 把一个对象桶画成三种状态之一：
+   *   normal —— 正常（无步骤模式，或本步没写 highlight）
+   *   dim    —— 淡出到 25%（背景，本步不讲它）
+   *   hl     —— 重点：换成暖橙 + 显示加粗描边 + 圆点放大
+   *
+   * 为什么要有 hl 这一档？——讲解视频的镜头现在完全不动，
+   * 如果重点只靠"别人变淡"来表达，图上其实没有任何一处真的被指出来。
+   * 加色加粗就是那个"红笔圈一下"。
+   */
+  private setBucketState(g: THREE.Group, state: 'normal' | 'dim' | 'hl') {
+    const dim = state === 'dim';
     g.traverse((node) => {
+      const ud = node.userData as Record<string, unknown>;
+      // 加粗描边：单独一份面片，只在 hl 状态显示（WebGL 的 linewidth 恒为 1px，
+      // 想画出 "粗线" 只能靠面片，改参数是没用的）
+      if (ud.__hlStroke) {
+        node.visible = state === 'hl';
+        return;
+      }
+      // 点：hl 时稍微放大，像被笔尖点了一下
+      if (ud.__dot) {
+        (node as THREE.Mesh).scale.setScalar(state === 'hl' ? 1.45 : 1);
+      }
       const mats = (node as THREE.Mesh).material;
       if (!mats) return;
       const list = Array.isArray(mats) ? mats : [mats];
@@ -398,7 +855,7 @@ export class SceneRenderer {
           userData: Record<string, unknown>;
         };
         if (!('opacity' in mat)) continue;
-        // 记住材质原本的 transparent / opacity：
+        // 记住材质原本的 transparent / opacity / color：
         // ① 精灵贴图本来透明，关掉会把透明区域渲染成黑块；
         // ② 可拖拽点的"拾取热区"是 opacity=0 的隐形大圆，
         //    若恢复时写成 1，会变成一个醒目的大白盘。
@@ -406,14 +863,41 @@ export class SceneRenderer {
           mat.userData.__origTransparent = mat.transparent;
           mat.userData.__origOpacity = mat.opacity;
         }
+        if (mat.color && mat.userData.__origColor === undefined) {
+          mat.userData.__origColor = mat.color.getHex();
+        }
         const origOpacity = mat.userData.__origOpacity as number;
-        mat.transparent = emphasized
-          ? (mat.userData.__origTransparent as boolean)
-          : true;
-        mat.opacity = emphasized ? origOpacity : origOpacity * 0.25;
+        // 文字精灵只调透明度、不染成橙色：橙字配橙线会糊成一团，读不清
+        const isSprite = (mat as unknown as { isSpriteMaterial?: boolean })
+          .isSpriteMaterial === true;
+        if (!isSprite && mat.color) {
+          mat.color.setHex(
+            state === 'hl' ? ACCENT : (mat.userData.__origColor as number),
+          );
+        }
+        mat.transparent = dim
+          ? true
+          : (mat.userData.__origTransparent as boolean);
+        mat.opacity = dim ? origOpacity * this.dimFactor : origOpacity;
         mat.needsUpdate = true;
       }
     });
+  }
+
+  /** 播放器专用：整幅画面缓慢推近（1 = 原样，>1 更近）。不影响主画布的滑杆/拖拽逻辑 */
+  private zoomScale = 1;
+
+  /**
+   * 设置推近倍率并立即重绘。
+   * 讲解视频在一步之内把倍率从 1.00 缓慢推到 1.06，画面就有"呼吸感"；
+   * 主画布不会调用它，视野保持固定。
+   */
+  setZoomScale(scale: number) {
+    const s = Math.max(0.6, Math.min(2, scale));
+    if (Math.abs(s - this.zoomScale) < 0.0005) return;
+    this.zoomScale = s;
+    this.updateCamera();
+    this.renderer.render(this.scene, this.camera);
   }
 
   private onResize() {
@@ -433,10 +917,13 @@ export class SceneRenderer {
     // 运镜期间：视野由补间给出的覆盖值决定（含宽高比适配），不用场景默认 view
     if (this.viewOverride) {
       const o = this.viewOverride;
-      this.camera.left = o.cx - o.halfW;
-      this.camera.right = o.cx + o.halfW;
-      this.camera.top = o.cy + o.halfH;
-      this.camera.bottom = o.cy - o.halfH;
+      // 推近倍率作用在视野半宽高上：倍率越大，看到的范围越小 = 画面更近
+      const hw = o.halfW / this.zoomScale;
+      const hh = o.halfH / this.zoomScale;
+      this.camera.left = o.cx - hw;
+      this.camera.right = o.cx + hw;
+      this.camera.top = o.cy + hh;
+      this.camera.bottom = o.cy - hh;
       this.camera.updateProjectionMatrix();
       return;
     }
@@ -457,10 +944,13 @@ export class SceneRenderer {
       effH = viewW / canvasAspect;
     }
 
-    this.camera.left = cx - effW / 2;
-    this.camera.right = cx + effW / 2;
-    this.camera.top = cy + effH / 2;
-    this.camera.bottom = cy - effH / 2;
+    // 推近倍率：视野范围除以倍率（倍率 1 = 原样，1.06 = 画面放大 6%）
+    const hw = effW / 2 / this.zoomScale;
+    const hh = effH / 2 / this.zoomScale;
+    this.camera.left = cx - hw;
+    this.camera.right = cx + hw;
+    this.camera.top = cy + hh;
+    this.camera.bottom = cy - hh;
     this.camera.updateProjectionMatrix();
   }
 
@@ -636,6 +1126,8 @@ export class SceneRenderer {
       new THREE.MeshBasicMaterial({ color: obj.color ?? COLORS.point }),
     );
     mesh.position.set(at[0], at[1], 0.2);
+    // 打标：高亮（视频讲解的重点）时把这个圆点放大一点
+    mesh.userData = { __dot: true };
     this.objectGroup.add(mesh);
 
     // 可拖拽的点：加一个透明的大圆作为「拾取热区」，方便点中
@@ -689,6 +1181,8 @@ export class SceneRenderer {
     const line = new THREE.Line(geo, material);
     if (obj.dashed) line.computeLineDistances();
     this.objectGroup.add(line);
+    // 高亮用的加粗描边（默认隐藏，视频讲解讲到这条边时才显示）
+    this.addThickStroke(from, to);
 
     if (obj.label) {
       const s = makeTextSprite(obj.label, {
@@ -795,6 +1289,53 @@ export class SceneRenderer {
         new THREE.LineBasicMaterial({ color }),
       ),
     );
+    // 每条边都备一份加粗描边，高亮三角形时整圈都变粗
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+      this.addThickStroke([a.x, a.y], [b.x, b.y]);
+    }
+  }
+
+  /**
+   * 在两点之间加一条"加粗线"（面片实现）。
+   *
+   * 为什么不直接调 linewidth？——WebGL 规范里 linewidth 只有 1 这一个保证值，
+   * Chrome/Windows 上写多少都渲染成 1px。想真变粗只能用有宽度的面片：
+   * 沿线段法线各撑开半个厚度，拼成一个矩形。
+   *
+   * 默认 visible=false，只有 setBucketState('hl') 时才打开。
+   */
+  private addThickStroke(from: [number, number], to: [number, number]) {
+    const dx = to[0] - from[0];
+    const dy = to[1] - from[1];
+    const l = Math.hypot(dx, dy);
+    if (l < 1e-9) return;
+    const w = this.pxToWorld(4.6) / 2; // 视觉上约 4~5px 粗
+    const nx = (-dy / l) * w;
+    const ny = (dx / l) * w;
+    const z = 0.15; // 略高于原线（原线在 0.1），避免同深度打架
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(
+        [
+          from[0] + nx, from[1] + ny, z,
+          to[0] + nx, to[1] + ny, z,
+          to[0] - nx, to[1] - ny, z,
+          from[0] - nx, from[1] - ny, z,
+        ],
+        3,
+      ),
+    );
+    geo.setIndex([0, 1, 2, 0, 2, 3]);
+    const mesh = new THREE.Mesh(
+      geo,
+      new THREE.MeshBasicMaterial({ color: ACCENT, side: THREE.DoubleSide }),
+    );
+    mesh.visible = false;
+    mesh.userData = { __hlStroke: true };
+    this.objectGroup.add(mesh);
   }
 
   private buildCircle(obj: CircleObject) {
@@ -1089,6 +1630,45 @@ function niceStep(range: number): number {
 
 function formatTick(v: number): string {
   return String(Number(v.toFixed(2)));
+}
+
+/**
+ * 按弧长把折线截断到 p（0~1）。
+ *
+ * 这是"线条生长"动画的全部秘密：不做任何几何重建，
+ * 只是每帧算出"画到这里为止"的那一段，交给 drawRange 去画。
+ * 角度弧也走同一条路——弧本来就是折线采样，截断到 40% 就是扫过 40%。
+ */
+function trimPolyline(
+  pts: Array<[number, number]>,
+  p: number,
+): Array<[number, number]> {
+  if (pts.length < 2) return [];
+  if (p >= 1) return pts;
+  if (p <= 0) return [];
+
+  let total = 0;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    total += Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+  }
+  if (total < 1e-9) return [pts[0], pts[1]];
+
+  const target = total * p;
+  const out: Array<[number, number]> = [pts[0]];
+  let acc = 0;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [x0, y0] = pts[i];
+    const [x1, y1] = pts[i + 1];
+    const seg = Math.hypot(x1 - x0, y1 - y0);
+    if (acc + seg >= target) {
+      const t = seg < 1e-9 ? 0 : (target - acc) / seg;
+      out.push([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t]);
+      return out;
+    }
+    acc += seg;
+    out.push([x1, y1]);
+  }
+  return out;
 }
 
 /** 导出类型，方便 UI 层使用 */

@@ -217,6 +217,105 @@ main {
   border-radius: var(--r-lg);
 }
 
+/* ---------- 推导模式：没有图形可画的题（纯代数 / 不等式 / 参数范围）---------- */
+#derive-board {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, #fdfaf5 0%, #faf6f0 100%);
+}
+#derive-board[hidden] {
+  display: none;
+}
+#db-note {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  font-size: 12px;
+  color: #8a6a4a;
+  background: rgba(234, 88, 12, 0.055);
+  border-bottom: 1px solid var(--accent-line);
+}
+#db-note-text {
+  flex: 1;
+  min-width: 0;
+}
+/* 「仍要看图」：模型可能把有图的题判成推导题，给一条自己验证的路 */
+.db-peek {
+  flex: none;
+  padding: 3px 12px;
+  font-size: 12px;
+}
+/* 看完图回推导板：推导板已经藏起来了，这个按钮浮在画布上 */
+.db-back {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  z-index: 5;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+#db-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 26px 42px;
+  scroll-behavior: smooth;
+}
+.db-step {
+  display: flex;
+  gap: 14px;
+  padding: 13px 15px;
+  border-radius: 12px;
+  border-left: 3px solid transparent;
+  transition: background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.db-step + .db-step {
+  margin-top: 4px;
+}
+.db-step.on {
+  background: #fff;
+  border-left-color: var(--accent);
+  box-shadow: 0 2px 14px rgba(80, 50, 20, 0.07);
+}
+.db-idx {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: #f1e7da;
+  color: #8a6a4a;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.db-step.on .db-idx {
+  background: var(--accent);
+  color: #fff;
+}
+.db-main {
+  min-width: 0;
+}
+.db-main h4 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.db-text {
+  font-size: 14.5px;
+  line-height: 1.95;
+  color: var(--text-2);
+}
+.db-text .katex {
+  font-size: 1.03em;
+}
+
 /* ---------- 侧栏：卡片列 ---------- */
 #panel {
   width: 350px;
@@ -1108,41 +1207,234 @@ select {
   position: absolute;
   inset: 0;
 }
+/* 有板书时把画布让出右侧一条：图形缩窄而不是被面板压住 */
+#vs-stage.has-board #vs-host-2d,
+#vs-stage.has-board #vs-host-3d {
+  right: 27%;
+}
+
+/* 「仍要看图」：模型把有图的题判成推导题时，自己把图叫出来 */
+#vs-stage .vs-peek {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 4;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+#vs-stage .vs-peek[hidden] {
+  display: none;
+}
+
+/* ---- 右侧板书栏：推导一行行累加（"像讲题"的主要视觉证据） ---- */
+#vs-board {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 27%;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 14px 14px;
+  background: #fffdf7;
+  border-left: 1px solid var(--accent-line);
+}
+#vs-board[hidden] {
+  display: none;
+}
+.vs-board-head {
+  flex: none;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  color: var(--accent);
+  opacity: 0.75;
+  margin-bottom: 8px;
+}
+#vs-board-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  scrollbar-width: thin;
+}
+.vs-board-line {
+  padding-left: 9px;
+  border-left: 2px solid #efe5d6;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: #57503f;
+  animation: vs-line-in 0.3s ease both;
+}
+.vs-board-line.key {
+  color: #b3541e;
+}
+.vs-board-line.on {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 6px 6px 0;
+  color: #8a3c0c;
+}
+.vs-board-line .katex {
+  font-size: 1em;
+}
+/* 步骤小标题：板书模式下用来分段，读起来像一页推导而不是一串公式 */
+.vs-board-line.heading {
+  border-left-color: transparent;
+  padding-left: 0;
+  margin-top: 6px;
+  font-size: 12.5px;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  opacity: 0.8;
+}
+/* ---- 板书模式：整块舞台让给推导板（本题没有对应图形）---- */
+#vs-stage.vs-boardmode #vs-board {
+  left: 0;
+  width: auto;
+  border-left: none;
+  padding: 26px 6% 92px;
+  background: linear-gradient(180deg, #fdfaf5 0%, #faf6f0 100%);
+  /* 内容比舞台高时由这一层滚动；内容矮时靠 body 的 auto 边距垂直居中 */
+  overflow-y: auto;
+}
+#vs-stage.vs-boardmode .vs-board-head {
+  display: none;
+}
+#vs-stage.vs-boardmode #vs-board-body {
+  flex: 0 0 auto;
+  min-height: auto;
+  overflow: visible;
+  margin: auto auto;
+  max-width: 900px;
+  width: 100%;
+  gap: 12px;
+}
+#vs-stage.vs-boardmode .vs-board-line {
+  font-size: 18px;
+  line-height: 1.75;
+  padding-left: 14px;
+}
+#vs-stage.vs-boardmode .vs-board-line.heading {
+  padding-left: 0;
+  font-size: 13px;
+}
+#video-studio.vs-fullscreen #vs-stage.vs-boardmode .vs-board-line {
+  font-size: 26px;
+}
+#video-studio.vs-fullscreen #vs-stage.vs-boardmode .vs-board-line.heading {
+  font-size: 16px;
+}
+#video-studio.vs-fullscreen #vs-stage.vs-boardmode #vs-board {
+  padding: 4% 7% 9%;
+}
+/* 板书模式下整块画面就是推导，字幕可以给足宽度、读整句 */
+#vs-stage.vs-boardmode .vs-subtitle {
+  left: 50%;
+  width: 88%;
+  max-width: none;
+  text-align: center;
+}
+#video-studio.vs-fullscreen #vs-stage.vs-boardmode .vs-subtitle {
+  width: 80%;
+}
+#vs-stage.vs-boardmode #vs-sub-text {
+  font-size: 15px;
+  line-height: 1.7;
+}
+#video-studio.vs-fullscreen #vs-stage.vs-boardmode #vs-sub-text {
+  font-size: 20px;
+}
+/* 讲稿自检提示：贴在右上角，别压住图形。
+   允许悬停——被丢掉的动作明细放在 title 里，要能看 */
+#vs-mode-note {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  z-index: 3;
+  max-width: 62%;
+  padding: 6px 12px;
+  border-radius: 12px;
+  background: rgba(254, 240, 230, 0.96);
+  border: 1px solid var(--accent-line);
+  color: #8a3c0c;
+  font-size: 12px;
+  line-height: 1.5;
+  pointer-events: auto;
+  cursor: help;
+}
+#vs-mode-note[hidden] {
+  display: none;
+}
+@keyframes vs-line-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---- 底部提示：只写"正在做的动作 + 半句话"，不再整条字幕压图 ---- */
 .vs-subtitle {
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  padding: 10px 16px 12px;
-  background: linear-gradient(180deg, rgba(15, 18, 26, 0) 0%, rgba(15, 18, 26, 0.72) 45%);
-  color: #fff;
+  left: 50%;
+  bottom: 12px;
+  max-width: 70%;
+  padding: 8px 16px 9px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid var(--accent-line);
+  box-shadow: 0 2px 12px rgba(60, 40, 20, 0.1);
+  color: var(--text);
   text-align: center;
   pointer-events: none;
+  /* 淡入淡出：讲完一句先淡出，切动作后再淡入下一句 */
+  opacity: 0;
+  transform: translate(-50%, 6px);
+  transition: opacity 0.28s ease, transform 0.28s ease;
+}
+.vs-subtitle.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 #vs-sub-title {
-  font-size: 15px;
+  font-size: 12.5px;
   font-weight: 600;
-  margin-bottom: 4px;
+  color: var(--accent);
+  margin-bottom: 3px;
 }
 #vs-sub-text {
-  font-size: 13px;
+  font-size: 13.5px;
   line-height: 1.55;
-  opacity: 0.95;
+  color: var(--text-2);
 }
 #vs-sub-text .katex {
-  color: #ffd9a8;
-  font-size: 0.95em;
+  color: var(--accent);
+  font-size: 1em;
 }
 #vs-hint {
   position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 32px;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 48px);
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid var(--accent-line);
+  box-shadow: 0 2px 10px rgba(60, 40, 20, 0.08);
   color: var(--text-2);
   text-align: center;
-  font-size: 14px;
+  font-size: 13px;
+}
+/* 关键：display 一旦写死，hidden 属性就失效了——提示会在讲解时一直挂在画面上。
+   画布现在是静止的，这行字压在图中央特别碍眼，必须显式尊重 hidden。 */
+#vs-hint[hidden] {
+  display: none;
 }
 .vs-progress {
   height: 4px;
@@ -1237,6 +1529,156 @@ select {
   font-size: 12px;
   color: var(--text-3);
 }
+
+/* ---------- 开场 / 收尾卡片 ---------- */
+.vs-card {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 13, 18, 0.94);
+  opacity: 0;
+  transition: opacity 0.28s ease;
+}
+.vs-card[hidden] {
+  display: none;
+}
+.vs-card.show {
+  opacity: 1;
+}
+.vs-card-inner {
+  max-width: 76%;
+  text-align: center;
+  color: #f2f4f9;
+}
+.vs-card-label {
+  font-size: 12px;
+  letter-spacing: 0.22em;
+  color: #f97316;
+  margin-bottom: 10px;
+}
+.vs-card-title {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.4;
+  margin-bottom: 12px;
+}
+.vs-card-body {
+  font-size: 15px;
+  line-height: 1.85;
+  color: #c9cfdb;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.vs-card-skip {
+  margin-top: 22px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  color: #cfd4e0;
+  padding: 6px 18px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.vs-card-skip:hover {
+  border-color: #f97316;
+  color: #fdba74;
+}
+
+/* ---------- 全屏沉浸播放 ---------- */
+body.vs-fs-lock {
+  overflow: hidden;
+}
+#video-studio.vs-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: #0b0d12;
+  display: flex;
+  overflow: hidden;
+}
+/* 全屏时仍要能被 hidden 关掉（两者优先级相同，靠顺序兜底） */
+#video-studio.vs-fullscreen[hidden] {
+  display: none;
+}
+#video-studio.vs-fullscreen .vs-inner {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  background: transparent;
+}
+#video-studio.vs-fullscreen .vs-head {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 0;
+  padding: 14px 22px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.5), transparent);
+}
+#video-studio.vs-fullscreen .vs-head h2 {
+  color: #e9ecf3;
+  font-size: 15px;
+}
+#video-studio.vs-fullscreen .vs-stage-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 0;
+  background: #0b0d12;
+}
+#video-studio.vs-fullscreen #vs-problem {
+  display: none; /* 全屏靠开场卡交代题目，画面保持干净 */
+}
+#video-studio.vs-fullscreen .vs-progress {
+  margin: 8px 22px 8px;
+}
+#video-studio.vs-fullscreen .vs-controls {
+  padding: 0 22px 16px;
+}
+#video-studio.vs-fullscreen .vs-note {
+  display: none;
+}
+#video-studio.vs-fullscreen .vs-subtitle {
+  bottom: 4%;
+  max-width: 62%;
+  padding: 10px 20px 11px;
+}
+#video-studio.vs-fullscreen #vs-sub-title {
+  font-size: 15px;
+}
+#video-studio.vs-fullscreen #vs-sub-text {
+  font-size: 16px;
+}
+#video-studio.vs-fullscreen .vs-board-line {
+  font-size: 16px;
+}
+#video-studio.vs-fullscreen .vs-board-head {
+  font-size: 12px;
+}
+#video-studio.vs-fullscreen .vs-card-title {
+  font-size: 30px;
+}
+#video-studio.vs-fullscreen .vs-card-body {
+  font-size: 17px;
+}
+
 @media (max-width: 720px) {
   #video-studio {
     width: calc(100% - 12px);
@@ -1244,4 +1686,69 @@ select {
   .vs-inner {
     padding: 12px;
   }
+}
+
+/* ---- 已知条件清单（视频分镜：讲到哪条哪条亮） ---- */
+#vs-knowns {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  max-width: min(40%, 300px);
+  padding: 8px 12px;
+  border-radius: 10px;
+  /* 视频画布是米白纸面，条件卡也走浅色，别用深色块抢图形 */
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 10px rgba(60, 40, 20, 0.07);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.65;
+  pointer-events: none;
+}
+#vs-knowns[hidden] {
+  display: none;
+}
+.vs-known {
+  position: relative;
+  padding-left: 14px;
+  opacity: 0.55;
+  transition: opacity 0.35s ease, color 0.35s ease;
+}
+.vs-known::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.62em;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+/* 点亮 = 这一句正在用这条已知条件 */
+.vs-known.on {
+  color: var(--accent);
+  opacity: 1;
+}
+.vs-fullscreen #vs-knowns {
+  left: 24px;
+  top: 24px;
+  max-width: 340px;
+  font-size: 14px;
+}
+@media (max-width: 720px) {
+  #vs-knowns {
+    max-width: 55%;
+    font-size: 11px;
+  }
+}
+
+/* 公式渲染失败时的兜底：等宽原文克制展示。
+   KaTeX 默认把解析失败的源码染红贴回页面——用户看到的"公式乱码"就是它。
+   这里接管失败呈现：不标红、不弹错误，只退化为一段等宽文字。 */
+.math-fallback {
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 0.92em;
+  color: inherit;
+  opacity: 0.8;
+  word-break: break-all;
 }

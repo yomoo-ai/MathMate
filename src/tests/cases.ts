@@ -235,6 +235,10 @@ export const CASES: TestCase[] = [
         // 「，」是全角逗号（U+FF0C），「−」是数学减号（U+2212）
         { type: 'point', id: 'A', at: '0\uff0ca', label: 'A' },
         { type: 'point', id: 'B', at: 'b \u2212 0, 0', label: 'B' },
+        // 连成线段：体检会把"既没约束、又没任何东西用到"的点判成孤点并拦下
+        // （真实几何题里两个点本来也不会孤立存在）。这条用例测的是全角符号能否求值，
+        // 不能因为场景过于极简被孤点规则误伤。
+        { type: 'segment', id: 'AB', from: '0\uff0ca', to: 'b \u2212 0, 0' },
       ],
       readouts: [{ label: 'AB', expr: 'dist(0, a, b, 0)' }],
     },
@@ -701,6 +705,87 @@ export const CASES: TestCase[] = [
       ],
     },
     expect: { kind: 'pass', noWarn: '没有把' },
+  },
+  {
+    name: '约束关：曲线上的点用 curve-point 派生（椭圆 + 滑杆 m）',
+    why:
+      '2026-11-05 真实事故：椭圆 x²/(m+9)+y²/(25−m)=1 那道题，曲线上的点全是手写坐标，' +
+      '位置没人验证，图与讲解从第一句就对不上。这条用例锁定新写法：' +
+      '曲线上的点用 derive 的 curve-point 取，位置天然在曲线上，且滑杆推 m 时点跟着曲线走。' +
+      '顺带锁定 pi 小写别名——t 写成 "pi/2" 必须能算。',
+    gate: '约束关',
+    scene: {
+      meta: { title: '椭圆上的点' },
+      visual: 'figure',
+      view: { xMin: -7, xMax: 7, yMin: -7, yMax: 7 },
+      params: [{ name: 'm', label: 'm', min: 0, max: 20, step: 0.5, value: 0 }],
+      objects: [
+        {
+          type: 'parametric',
+          id: 'E',
+          xExpr: 'sqrt(m+9)*cos(t)',
+          yExpr: 'sqrt(25-m)*sin(t)',
+        },
+        {
+          type: 'point',
+          id: 'P',
+          derive: { kind: 'curve-point', curve: 'E', t: 'pi/2' },
+          label: 'P',
+        },
+      ],
+      constraints: [{ type: 'on-curve', p: 'P', curve: 'E' }],
+    },
+    expect: { kind: 'pass', noWarn: '超出曲线' },
+  },
+  {
+    name: '【应拦】曲线上的点手写坐标，偏出曲线',
+    why:
+      '手写的坐标几乎不可能正好落在曲线上（真实事故里 P 飘在椭圆外 1 个多单位，' +
+      '肉眼却看不出）。on-curve 必须算出实际距离并打回，而不是"看着差不多"就放过。',
+    gate: '约束关',
+    scene: {
+      meta: { title: '点不在椭圆上' },
+      view: { xMin: -7, xMax: 7, yMin: -7, yMax: 7 },
+      params: [{ name: 'm', label: 'm', min: 0, max: 20, step: 0.5, value: 0 }],
+      objects: [
+        {
+          type: 'parametric',
+          id: 'E',
+          xExpr: 'sqrt(m+9)*cos(t)',
+          yExpr: 'sqrt(25-m)*sin(t)',
+        },
+        { type: 'point', id: 'P', at: [3, 3], label: 'P' },
+      ],
+      constraints: [{ type: 'on-curve', p: 'P', curve: 'E' }],
+    },
+    expect: { kind: 'fail', match: '在曲线 E 上' },
+  },
+  {
+    name: '【应拦】curve-point 引用了不存在的曲线 id',
+    why:
+      '写错曲线 id 时坐标会变成 NaN，以前只会报一句"未定义名称 NaN"，' +
+      '完全指不到真正的问题。现在必须明说"objects 里没有这个 id"。',
+    gate: '格式关',
+    scene: {
+      meta: { title: '曲线 id 写错' },
+      view: { xMin: -7, xMax: 7, yMin: -7, yMax: 7 },
+      params: [],
+      objects: [
+        {
+          type: 'parametric',
+          id: 'E',
+          xExpr: '3*cos(t)',
+          yExpr: '5*sin(t)',
+        },
+        {
+          type: 'point',
+          id: 'P',
+          derive: { kind: 'curve-point', curve: 'nope', t: 0 },
+          label: 'P',
+        },
+      ],
+    },
+    expect: { kind: 'fail', match: '没有这个 id' },
   },
 ];
 
@@ -1422,6 +1507,78 @@ export const CASES_3D: TestCase3D[] = [
       ],
     },
     expect: { kind: 'fail', match: 'cut' },
+  },
+  {
+    name: '【应拦】截面结论写错边数：实测五边形，步骤写"四边形"',
+    why:
+      '真实事故（2026-11-05）：正方体过 D、M、N 的截面，程序逐面求交算出五边形，' +
+      '图形是对的，但 steps 里写死「截面为四边形 DMNP」——图和答案互相打脸。' +
+      '旧体检只验坐标/约束/截面切没切穿，唯独不验"最后得出的结论"。' +
+      '这条守住：结论边数必须等于实测边数，否则报错让模型重写。',
+    gate: '数值关',
+    scene: (() => {
+      const s = buildCubeSection(cubeSectionDefaults);
+      return {
+        ...s,
+        steps: [...(s.steps ?? []), { title: '结论', text: '综上，截面为四边形 $DMNP$。' }],
+      };
+    })(),
+    expect: { kind: 'fail', match: '五边形' },
+  },
+  {
+    name: '【应拦】步骤里点名、图上没有的点',
+    why:
+      '真实事故（2026-11-06）：板书逐行写「延长 DM 交 AA₁ 于 R，连接 RN」，' +
+      '但 R 从来没在 objects 里声明——图上只有 D、M、N，读者看到"讲解提到、图上找不到"。' +
+      '旧体检只看 steps 的 highlight/reveal 里的 id，不看正文。这条守住：' +
+      '正文点名的点必须在图里存在，否则报错让模型补（延长线交点用 intersect 派生）。',
+    gate: '综合',
+    scene: (() => {
+      const s = buildCubeSection(cubeSectionDefaults);
+      return {
+        ...s,
+        steps: [
+          ...(s.steps ?? []),
+          { title: '作图', text: '延长 $DM$ 交 $AA_1$ 于 R，连接 $RN$。' },
+        ],
+      };
+    })(),
+    expect: { kind: 'fail', match: 'R' },
+  },
+  {
+    name: '金标准·延长线求交：AC₁ 与 BD₁ 相交于正方体中心',
+    why:
+      '立体几何作截面的标准手法是"延长两条线求交点"。这条守住 intersect 派生：' +
+      '① 按无限长直线求交（可落在延长线上）；② 解出来的坐标是对的（中心 O=(1,1,1)，AO=√3）；' +
+      '③ 坐标保持表达式形式，拖参数时点跟着走。',
+    gate: '综合',
+    scene: {
+      space: '3d',
+      meta: { title: '对角线交点' },
+      params: [{ name: 'a', min: 2, max: 6, value: 2, step: 0.5, label: '棱长' }],
+      objects: [
+        { type: 'point3', id: 'A', label: 'A', at: [0, 0, 'a'] },
+        { type: 'point3', id: 'B', label: 'B', at: ['a', 0, 'a'] },
+        { type: 'point3', id: 'C', label: 'C', at: ['a', 'a', 'a'] },
+        { type: 'point3', id: 'D', label: 'D', at: [0, 'a', 'a'] },
+        { type: 'point3', id: 'A1', label: 'A₁', at: [0, 0, 0] },
+        { type: 'point3', id: 'B1', label: 'B₁', at: ['a', 0, 0] },
+        { type: 'point3', id: 'C1', label: 'C₁', at: ['a', 'a', 0] },
+        { type: 'point3', id: 'D1', label: 'D₁', at: [0, 'a', 0] },
+        {
+          type: 'point3',
+          id: 'O',
+          label: 'O',
+          derive: { kind: 'intersect', l1: ['A', 'C1'], l2: ['B', 'D1'] },
+        },
+        { type: 'edge3', id: 'AC1', a: 'A', b: 'C1', dashed: true },
+        { type: 'edge3', id: 'BD1', a: 'B', b: 'D1', dashed: true },
+        { type: 'edge3', id: 'OA', a: 'O', b: 'A' },
+      ],
+      readouts: [{ label: 'AO', expr: 'dist3(O,A)' }],
+      steps: [{ title: '求交', text: '两条体对角线交于中心 O。', highlight: ['O'] }],
+    },
+    expect: { kind: 'pass', readouts: { AO: '1.73' } },
   },
   {
     name: '金标准·正方体截面：过 D、M、N 的平面截出五边形',

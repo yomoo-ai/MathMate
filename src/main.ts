@@ -10,7 +10,6 @@
  */
 import './styles.css';
 import 'katex/dist/katex.min.css';
-import katex from 'katex';
 import { SceneRenderer } from './core/renderer';
 import { Scene3DRenderer } from './core/renderer3d';
 import { isScene3D } from './protocol/scene3d';
@@ -25,6 +24,8 @@ import { renderIssueReport, clearIssueReport } from './ui/issueReport';
 import { mountVideoStudio } from './ui/videoStudio';
 import { evalAny } from './protocol/expr';
 import type { Scene, StepDef } from './protocol/scene';
+import { isBoardScene, guardVisual } from './core/visualMode';
+import { renderMathText } from './ui/mathText';
 import { SAMPLE_SCENE_JSON } from './protocol/samples';
 import { requestSceneFromPrompt, requestSceneFromPrompt3D, transcribeImage } from './llm/stub';
 import {
@@ -151,14 +152,118 @@ function defaultsOf(scene: Scene | Scene3D): Record<string, number> {
   return d;
 }
 
+/** 是否处于推导模式（没有图形可画的题） */
+let deriveMode = false;
+
 /** 2D 正交画布 / 3D 透视画布只显示其中一块 */
 function setActiveSpace(space: '2d' | '3d') {
   for (const c of Array.from(canvasContainer.querySelectorAll('canvas'))) {
-    (c as HTMLCanvasElement).style.display =
-      c.getAttribute('data-space') === space ? 'block' : 'none';
+    const show = !deriveMode && c.getAttribute('data-space') === space;
+    (c as HTMLCanvasElement).style.display = show ? 'block' : 'none';
   }
-  renderer3d?.setActive(space === '3d');
+  renderer3d?.setActive(space === '3d' && !deriveMode);
 }
+
+// ---------------------------------------------------------------
+// 推导模式：没有图形可画的题（纯代数 / 不等式 / 参数范围）
+// ---------------------------------------------------------------
+/**
+ * 为什么要有这个模式？
+ * 以前所有题都被强制配一张图。几何题没问题，但解不等式、求参数范围这类题
+ * 没有可指认的对象，配上的图只能是装饰——装饰必然与讲解错位
+ * （真实事故：椭圆求 m 范围，画成一张与 m 无关的静态椭圆）。
+ * 现在这类题改成排推导板书：不画图，把 steps 一条条摊开，反而更像讲题。
+ */
+const deriveEl = document.getElementById('derive-board') as HTMLElement | null;
+const deriveNoteEl = document.getElementById('db-note-text') as HTMLElement | null;
+const deriveBodyEl = document.getElementById('db-body') as HTMLElement | null;
+const derivePeekBtn = document.getElementById('db-peek') as HTMLButtonElement | null;
+const deriveBackBtn = document.getElementById('db-back') as HTMLButtonElement | null;
+
+/**
+ * 被判定为"没有图形"的那个场景。
+ *
+ * 模型有时会把明明有图的题判成 board（比如把"看图求角"当成纯计算）。
+ * 这时推导板旁给一个「仍要看图」按钮：不自动翻案，但人可以用一眼判断
+ * 模型是不是判错了——比让人重跑一次生成便宜得多。
+ */
+let boardScene: Scene | null = null;
+
+function setDeriveMode(on: boolean) {
+  if (deriveMode === on) return;
+  deriveMode = on;
+  canvasContainer.classList.toggle('derive-mode', on);
+  if (deriveEl) deriveEl.hidden = !on;
+  if (!on && deriveBodyEl) deriveBodyEl.innerHTML = '';
+  setActiveSpace(activeSpace);
+}
+
+/** 把 steps 排成一张推导板：题目标题 + 逐条推导，当前步高亮 */
+function renderDeriveBoard(steps: StepDef[], notice?: string | null) {
+  if (!deriveBodyEl) return;
+  if (deriveNoteEl) {
+    deriveNoteEl.textContent = notice || '本题没有可对应的图形，已切换为推导模式';
+  }
+  // 有图形对象才给"仍要看图"的入口：一个对象都没有的题，点开也是空坐标轴
+  if (derivePeekBtn) {
+    derivePeekBtn.hidden = !boardScene || boardScene.objects.length === 0;
+  }
+  if (steps.length === 0) {
+    deriveBodyEl.innerHTML =
+      '<p class="msg" style="margin:0">这道题没有分步讲解数据，暂时只能显示题目。</p>';
+    return;
+  }
+  deriveBodyEl.innerHTML = steps
+    .map(
+      (s, i) => `
+      <div class="db-step" data-idx="${i}">
+        <div class="db-idx">${i + 1}</div>
+        <div class="db-main">
+          <h4>${escapeHtml(s.title)}</h4>
+          <div class="db-text">${renderMathText(s.text)}</div>
+        </div>
+      </div>`,
+    )
+    .join('');
+  syncDeriveActive(false);
+}
+
+/** 当前步高亮 + 滚到视野中间（播放/翻步时视觉焦点始终跟着走） */
+function syncDeriveActive(scroll = true) {
+  if (!deriveBodyEl) return;
+  const items = Array.from(deriveBodyEl.querySelectorAll('.db-step'));
+  items.forEach((el, i) => el.classList.toggle('on', i === stepIndex));
+  if (!scroll) return;
+  const active = deriveBodyEl?.querySelectorAll('.db-step')[stepIndex] as HTMLElement | undefined;
+  active?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+/**
+ * 推导板 → 临时看图。
+ *
+ * 用途只有一种：模型把本来有图的题判成了"没有图形"。这时不自动翻案
+ * （参数族那类题确实不该出图），但让人能一眼看出"这题其实有图"。
+ */
+function showFigureAnyway() {
+  if (!boardScene || boardScene.objects.length === 0) return;
+  setDeriveMode(false);
+  // 画布刚显示出来，渲染器要先按新尺寸量一次，再画（否则按 0 尺寸算相机）
+  window.dispatchEvent(new Event('resize'));
+  renderer.setScene(boardScene, params);
+  renderer.setStep(stepIndex);
+  if (deriveBackBtn) deriveBackBtn.hidden = false;
+}
+
+/** 看图之后回推导板：推导板内容退出时被清空过，这里重排 */
+function backToDerive() {
+  if (!boardScene) return;
+  setDeriveMode(true);
+  renderDeriveBoard(boardScene.steps ?? [], null);
+  if (deriveBackBtn) deriveBackBtn.hidden = true;
+}
+
+derivePeekBtn?.addEventListener('click', showFigureAnyway);
+deriveBackBtn?.addEventListener('click', backToDerive);
 
 function ensureRenderer3d(): Scene3DRenderer {
   if (!renderer3d) {
@@ -176,7 +281,12 @@ function ensureRenderer3d(): Scene3DRenderer {
  * resetView=false 用于"拖滑杆改参数"——此时几何变了但视角该保持。
  * fromEntry=true 表示来自顶部场景标签页（只有它才允许滑杆重建场景）。
  */
-function applyScene(scene: AnyScene, resetView = true, fromEntry = false) {
+function applyScene(
+  scene: AnyScene,
+  resetView = true,
+  fromEntry = false,
+  notice?: string | null,
+) {
   // 非场景标签页来的数据（LLM 生成 / 题本 / 手贴 JSON）不能留着旧 entry：
   // 否则下一次拖滑杆会按旧场景重建，把刚生成的东西覆盖掉
   if (!fromEntry) currentEntry = null;
@@ -186,6 +296,7 @@ function applyScene(scene: AnyScene, resetView = true, fromEntry = false) {
     <p>${escapeHtml(scene.meta.subtitle ?? '')}</p>`;
 
   if (isScene3D(scene)) {
+    if (deriveMode) setDeriveMode(false);
     activeScene3D = scene;
     activeSpace = '3d';
     params = defaultsOf(scene);
@@ -207,10 +318,16 @@ function applyScene(scene: AnyScene, resetView = true, fromEntry = false) {
   activeScene3D = null;
   activeSpace = '2d';
   params = defaultsOf(scene);
-  renderer.setScene(scene, params);
+  // 没有可对应图形的题不渲染画布：一张装饰图比没有图更糟
+  const board = isBoardScene(scene);
+  boardScene = board ? scene : null;
+  if (deriveBackBtn) deriveBackBtn.hidden = true;
+  setDeriveMode(board);
+  if (!board) renderer.setScene(scene, params);
   setActiveSpace('2d');
   buildSliders(scene);
   refreshReadouts();
+  if (board) renderDeriveBoard(scene.steps ?? [], notice);
   setupSteps(scene.steps);
 }
 
@@ -226,22 +343,7 @@ let stepIndex = 0;
 /** 当前场景的分步讲解（2D / 3D 共用一套导航逻辑） */
 let currentSteps: StepDef[] = [];
 
-/** 把 "文字 $公式$ 文字" 渲染成 HTML：公式段交给 KaTeX，其余转义 */
-function renderMathText(text: string): string {
-  const parts = text.split(/\$([^$]+)\$/g);
-  return parts
-    .map((seg, i) => {
-      if (i % 2 === 1) {
-        try {
-          return katex.renderToString(seg, { throwOnError: false });
-        } catch {
-          return escapeHtml(seg);
-        }
-      }
-      return escapeHtml(seg).replace(/\n/g, '<br>');
-    })
-    .join('');
-}
+/** 把 "文字 $公式$ 文字" 渲染成 HTML：统一实现见 ui/mathText（含脏数据清洗） */
 
 function setupSteps(steps: StepDef[] | undefined) {
   const panel = $<HTMLElement>('step-panel');
@@ -282,7 +384,10 @@ function showStep() {
   $<HTMLButtonElement>('step-prev').disabled = stepIndex === 0;
   $<HTMLButtonElement>('step-next').disabled = stepIndex === steps.length - 1;
   // 交给当前生效的那个渲染器
-  if (activeSpace === '3d') {
+  if (deriveMode) {
+    // 推导模式没有画布可联动，改为在推导板上定位当前步
+    syncDeriveActive();
+  } else if (activeSpace === '3d') {
     renderer3d?.setStep(stepIndex);
   } else {
     renderer.setStep(stepIndex);
@@ -592,10 +697,15 @@ async function generateScene(prompt: string, source: NotebookSource = 'text') {
       lastIssues = issues;
       renderIssueReport(llmReport, issues);
     };
-    const scene: AnyScene = solidModeInput.checked
+    const raw: AnyScene = solidModeInput.checked
       ? await requestSceneFromPrompt3D(prompt, pushLog, onIssues)
       : await requestSceneFromPrompt(prompt, pushLog, onIssues);
-    applyScene(scene);
+    // 兜底闸门：声明了"要出图"却一个对象都没有 → 降级成推导板书，
+    // 而不是渲染一张空坐标轴
+    const guarded = isScene3D(raw) ? { scene: raw, notice: null } : guardVisual(raw);
+    const scene: AnyScene = guarded.scene;
+    if (guarded.notice) pushLog(`↺ ${guarded.notice}`);
+    applyScene(scene, true, false, guarded.notice);
     // 生成的场景同步填进 JSON 演示框——能看到模型到底输出了什么
     jsonInput.value = JSON.stringify(scene, null, 2);
     tabsEl.value = ''; // 生成的是自定义题目 → 下拉框回到占位项

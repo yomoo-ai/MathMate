@@ -144,6 +144,18 @@ const NATIVE: Record<string, unknown> = {
   pow: Math.pow,
   log: Math.log,
   exp: Math.exp,
+  /**
+   * 符号函数：sign(正数)=1、sign(0)=0、sign(负数)=−1。
+   *
+   * 加它是为了让「随参数切换分支」能写成闭式表达式，而不需要条件语句。
+   * 典型用法（圆锥曲线焦点随 m 换轴）：
+   *   s = (1+sign(8-m))/2  —— m<8 时 s=1，m>8 时 s=0
+   *   F₁ = [c*s, c*(1-s)]  —— 焦点自动落在 y 轴或 x 轴
+   * 没有它就只能给两种情形各画一遍，没法做连续动画。
+   */
+  sign: Math.sign,
+  /** 把 v 夹在 [lo, hi] 之间（写端点附近的扫参时很好用） */
+  clamp: (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v)),
   PI: Math.PI,
   /** 弧度 → 角度 */
   deg: (r: number) => (r * 180) / Math.PI,
@@ -294,6 +306,19 @@ const SYMBOL_MAP: Array<[RegExp, string]> = [
   [/π/g, 'PI'],
 ];
 
+/**
+ * 整词 `pi` → `PI`。
+ *
+ * 常量表里登记的是大写 PI，但模型（和人）几乎一律写小写 `pi`：
+ * 真实事故——curve-point 的 t 写成 "pi/2"，坐标直接算成 NaN，
+ * 报错却说"pi is not defined"，看着像模型没定义参数，实际是别名缺失。
+ * 只换完整标识符，`pix`、`pi_1` 这类名字不受影响。
+ *
+ * 代价：参数不能取名 pi（会被当成常量）。这个撞名没有实际意义，
+ * 不值得为它引入作用域感知的替换。
+ */
+const PI_ALIAS_RE = /(^|[^A-Za-z0-9_])pi(?![A-Za-z0-9_])/g;
+
 /** 规范化一个表达式字符串（不改变语义，只统一符号） */
 export function normalizeExpr(s: string): string {
   // 容忍运行时传进来数字：arc 的 from/to、radius 这类字段模型常写成纯数字
@@ -301,6 +326,7 @@ export function normalizeExpr(s: string): string {
   // "s.replace is not a function"，报错还完全指不到真正的字段。
   let out = String(s);
   for (const [re, rep] of SYMBOL_MAP) out = out.replace(re, rep);
+  out = out.replace(PI_ALIAS_RE, '$1PI');
   return out;
 }
 
@@ -440,13 +466,20 @@ export function evalVec2Detailed(v: Vec2Like, scope: Scope): Vec2EvalResult {
       const src =
         typeof rawEl === 'number' ? String(rawEl) : normalizeExpr(String(rawEl));
       let num: number;
-      try {
-        num = evalNumber(src, scope);
-      } catch (err) {
-        return {
-          value: null,
-          reason: `坐标数组的 ${axis} 分量「${src}」求值抛异常：${(err as Error).message}`,
-        };
+      // 纯数字直接采信：以前这里也会走一遍求值，NaN 被转成字符串 "NaN"
+      // 再当成变量名，报出"未定义的名称 NaN"——看着像模型引用了什么变量，
+      // 实际只是上一阶段（派生点解算）没算出坐标。
+      if (typeof rawEl === 'number') {
+        num = rawEl;
+      } else {
+        try {
+          num = evalNumber(src, scope);
+        } catch (err) {
+          return {
+            value: null,
+            reason: `坐标数组的 ${axis} 分量「${src}」求值抛异常：${(err as Error).message}`,
+          };
+        }
       }
       if (!isFinite(num)) {
         return {

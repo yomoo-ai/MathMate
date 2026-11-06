@@ -387,6 +387,14 @@ function checkIsolatedPoints(scene: Scene3D, pts: Map<string, V3>): Issue[] {  c
   for (const c of scene.constraints ?? []) {
     for (const id of constraintPointIds(c)) used.add(id);
   }
+  // 讲解正文里点名的点同理也算"在用"：程序代改补出来的交点
+  // （"延长 DM 交 AA₁ 于 P"的 P）不连棱、不进面、可能也没约束，
+  // 只活在讲解文字里——按原规则会被提醒"孤立"，那是误伤。
+  for (const step of scene.steps ?? []) {
+    const norm = normalizeVertexToken(String(step.text ?? ''));
+    const re = /(^|[^A-Za-z0-9])([A-Z]\d?)(?![A-Za-z0-9])/g;
+    for (const m of norm.matchAll(re)) used.add(m[2]);
+  }
   const issues: Issue[] = [];
   for (const id of pts.keys()) {
     if (!used.has(id)) {
@@ -665,6 +673,138 @@ function checkSections(
       issues.push({ level: 'error', where: obj.id, message: `截面「${obj.id}」：${sol.reason}` });
     }
   }
+  return issues;
+}
+
+const CN_NUM: Record<string, number> = {
+  三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8,
+};
+/** 数字 → 中文（报错文案用"五边形"而不是"5 边形"，和题面说法一致） */
+const NUM_CN = ['零', '一', '二', '三', '四', '五', '六', '七', '八'];
+
+/**
+ * 把下标写法统一成普通数字：D₁ → D1。模型两种混着写，比对前先归一。
+ */
+export function normalizeVertexToken(s: string): string {
+  return s
+    .replace(/[₀-₉]/g, (c) => String('₀₁₂₃₄₅₆₇₈₉'.indexOf(c)))
+    .replace(/\s+/g, '');
+}
+
+/**
+ * 截面结论核对：步骤文字里写的「n 边形」必须等于程序实测边数。
+ *
+ * 真实事故（2026-11-05，正方体过 D、M、N 的截面）：
+ * 求解器逐面求交算出**五边形**，图形画对了，但步骤写「截面为四边形 DMNP」。
+ * 旧体检完全不看这句话——它能验坐标、验约束、验截面切没切穿，
+ * 唯独不验"你最后得出的结论"。用户看到的是"自己数出五边形、系统说四边形"。
+ *
+ * 判定范围收得很紧，宁可不报也不误报：
+ *   · 场景里恰好一个 section3（多个时分不清在说哪一个）；
+ *   · 切出来是多边形（3~6 边），不是椭圆/圆；
+ *   · 只在「同一句里同时出现"截面"和"n 边形"」时认定为结论。
+ */
+/**
+ * 截面实测信息：边数 + 按环绕顺序的顶点。
+ *
+ * 体检器（结论核对）和程序代改（autofix3d）共用这一份计算，
+ * 保证"体检说错了什么"和"程序改成了什么"永远一致。
+ *
+ * 只有场景里**恰好一个 section3** 且切出的是多边形时才有值；
+ * 其它情况返回 null（多个截面分不清在说谁、椭圆没有"边数"）。
+ */
+export interface SectionFacts3D {
+  /** section3 对象的 id */
+  id: string;
+  /** 多边形边数（3~8） */
+  n: number;
+  /** 每个截面顶点：能对上已声明点就给它的 id，对不上给 null */
+  names: Array<string | null>;
+  /** 与 names 对齐的实测坐标（names[i] 为 null 时用它） */
+  positions: V3[];
+}
+
+export function sectionFacts3D(scene: Scene3D): SectionFacts3D | null {
+  const sections = scene.objects.filter((o) => o.type === 'section3') as Section3Object[];
+  if (sections.length !== 1) return null;
+  const obj = sections[0];
+
+  const scope = defaultScope(scene);
+  const { pts } = collectPoints(scene, scope);
+  if (pts.size === 0) return null;
+  const { specs } = resolveSolidSpecs(scene, pts, scope);
+  const { targets } = resolveSectionTargets(scene, pts, specs);
+  const target = targets.get(obj.id);
+  if (!target) return null;
+  const pl = evalSectionPlane(obj, pts, scope);
+  if ('error' in pl) return null;
+
+  const sol = solveSectionOn(target, pl.plane);
+  if (!sol.ok || sol.shape !== 'polygon' || sol.n < 3) return null;
+
+  // 顶点 → 已知点 id（顶点常常是"棱上的落点"，模型可能声明过也可能没有）
+  let scale = 1;
+  for (const p of pts.values()) scale = Math.max(scale, Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2]));
+  const tol = 1e-3 * scale;
+  const names: Array<string | null> = [];
+  const positions: V3[] = [];
+  for (const v of sol.loop) {
+    let bestId: string | null = null;
+    let bestD = Infinity;
+    for (const [id, p] of pts) {
+      const d = len3(sub3(p, v));
+      if (d < bestD) {
+        bestD = d;
+        bestId = id;
+      }
+    }
+    names.push(bestD <= tol ? bestId : null);
+    positions.push(v);
+  }
+  return { id: obj.id, n: sol.n, names, positions };
+}
+
+function checkSectionClaims(
+  scene: Scene3D,
+): Issue[] {
+  const issues: Issue[] = [];
+  if (!(scene.steps ?? []).length) return issues;
+
+  const facts = sectionFacts3D(scene);
+  if (!facts) return issues;
+  const solN = facts.n;
+  const vertexNames = facts.names.map((id, i) => id ?? `(${fmtV(facts.positions[i])})`);
+
+  (scene.steps ?? []).forEach((step, i) => {
+    const text = String(step.text ?? '');
+    if (!text.includes('截面')) return;
+
+    const re = /([三四五六七八])\s*边形\s*([A-Z][A-Za-z0-9₀-₉]{1,9})?/g;
+    for (const m of text.matchAll(re)) {
+      const claimed = CN_NUM[m[1]];
+      if (!claimed || claimed === solN) continue;
+
+      const listed = m[2] ? normalizeVertexToken(m[2]) : '';
+      const actual = vertexNames.map(normalizeVertexToken);
+      const missing = actual.filter((v) => v && !listed.includes(v));
+
+      issues.push({
+        level: 'error',
+        where: `steps[${i}]`,
+        message:
+          `第 ${i + 1} 步的结论写「${m[1]}边形${m[2] ? ' ' + m[2] : ''}」，` +
+          `但按 cut.vertices + plane 逐面求交，这个截面实际是**${NUM_CN[solN]}边形**（${solN} 条边），` +
+          `顶点依次为 ${vertexNames.join('、')}。` +
+          `截面边数 = 平面穿过的面数，不能只按已知那三个点就下结论` +
+          `——三个点只定了平面，第四个、第五个顶点要由其它面与这个平面的交线求出。` +
+          (listed && missing.length
+            ? `你列出的顶点还漏了 ${missing.join('、')}。`
+            : '') +
+          `请把结论改成「${NUM_CN[solN]}边形」并写全顶点（读数里可直接用 secN3(${facts.id}) 取边数）。`,
+      });
+      break; // 同一句只报一次
+    }
+  });
   return issues;
 }
 
@@ -1068,6 +1208,197 @@ function checkCamera(scene: Scene3D): Issue[] {
 // 主入口
 // ---------------------------------------------------------------
 
+/**
+ * 延长线求交的派生点：两条直线必须真的相交。
+ *
+ * "延长 DM 交 AA₁ 于 P" 是立体几何作截面的标准手法，但它成立的前提是
+ * 这两条线**共面且不平行**。模型经常随手写，方向其实异面——那样解出来的
+ * 是一个"两线最近点"式的假点，位置毫无意义却看着像真的。
+ * 这里按"两线最短距离"判：> 容差 就是异面，直接打回。
+ */
+/**
+ * 「直线 K 与 L 异面/平行」时的补救提示：保留其中一条，枚举所有与它
+ * 共面相交的已声明线段，给模型一份**真实可选**的清单。
+ *
+ * 为什么需要：体检报错里的示例线对曾是硬编码的（上一道题的答案），
+ * 模型照抄就声明出第二条异面线对，越改越错。程序算得出的东西
+ * 不该让模型猜——这里算出来给到报错文案里。
+ *
+ * 与保留线共享端点的线段跳过：交点就是已有顶点，没有构造价值。
+ */
+export function intersectCandidates(kept: [string, string], pts: Map<string, V3>, cap = 8): string[] {
+  const A = pts.get(kept[0]);
+  const B = pts.get(kept[1]);
+  if (!A || !B) return [];
+  const r = sub3(B, A);
+  const rl = len3(r);
+  if (rl < 1e-9) return [];
+
+  let scale = 1;
+  for (const p of pts.values()) {
+    scale = Math.max(scale, Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2]));
+  }
+  const tol = 1e-4 * scale;
+
+  const ids = [...pts.keys()].sort();
+  const out: string[] = [];
+  for (let i = 0; i < ids.length && out.length < cap; i++) {
+    for (let j = i + 1; j < ids.length && out.length < cap; j++) {
+      const X = ids[i];
+      const Y = ids[j];
+      if (X === kept[0] || X === kept[1] || Y === kept[0] || Y === kept[1]) continue;
+      const P = pts.get(X)!;
+      const Q = pts.get(Y)!;
+      const w = sub3(Q, P);
+      const n = cross3(r, w);
+      const nl = len3(n);
+      if (nl <= 1e-9 * (rl * len3(w) + 1e-9)) continue; // 平行/重合
+      const gap = Math.abs(dot3(sub3(P, A), n)) / nl;
+      if (gap > tol) continue; // 异面
+      // 交点若就是某个已声明顶点（如 CC1 恰好穿过 M），没有构造价值，跳过
+      const n2 = nl * nl;
+      const t = dot3(cross3(sub3(P, A), w), n) / n2;
+      const hit: V3 = [A[0] + t * r[0], A[1] + t * r[1], A[2] + t * r[2]];
+      let coincides = false;
+      for (const p of pts.values()) {
+        if (Math.abs(p[0] - hit[0]) + Math.abs(p[1] - hit[1]) + Math.abs(p[2] - hit[2]) <= 3 * tol) {
+          coincides = true;
+          break;
+        }
+      }
+      if (coincides) continue;
+      out.push(`${X}${Y}`);
+    }
+  }
+  return out;
+}
+
+/** 把候选线对拼进报错文案（两条保留线各算一遍） */
+function candidateHint(l1: [string, string], l2: [string, string], pts: Map<string, V3>): string {
+  const parts: string[] = [];
+  const c1 = intersectCandidates(l1, pts);
+  if (c1.length > 0) parts.push(`若保留直线 ${l1[0]}${l1[1]}，与它共面相交的已声明线段有：${c1.join('、')}`);
+  const c2 = intersectCandidates(l2, pts);
+  if (c2.length > 0) parts.push(`若保留直线 ${l2[0]}${l2[1]}，与它共面相交的已声明线段有：${c2.join('、')}`);
+  return parts.length > 0 ? `可用的候选（程序实测，不是示例）：${parts.join('；')}。` : '';
+}
+
+function checkIntersectDerives(scene: Scene3D, pts: Map<string, V3>): Issue[] {
+  const issues: Issue[] = [];
+  let scale = 1;
+  for (const p of pts.values()) {
+    scale = Math.max(scale, Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2]));
+  }
+  const tol = 1e-4 * scale;
+
+  for (const obj of scene.objects) {
+    if (obj.type !== 'point3' || obj.derive?.kind !== 'intersect') continue;
+    const d = obj.derive;
+    const A = pts.get(d.l1[0]);
+    const B = pts.get(d.l1[1]);
+    const C = pts.get(d.l2[0]);
+    const D = pts.get(d.l2[1]);
+    if (!A || !B || !C || !D) continue; // 缺点由 collectPoints 报
+    const r = sub3(B, A);
+    const w = sub3(D, C);
+    const n = cross3(r, w);
+    const nl = len3(n);
+    const pair = `直线 ${d.l1[0]}${d.l1[1]} 与 ${d.l2[0]}${d.l2[1]}`;
+    if (nl <= 1e-9 * (len3(r) * len3(w) + 1e-9)) {
+      issues.push({
+        level: 'error',
+        where: obj.id,
+        message:
+          `点 ${obj.id} 声明为「${pair} 的交点」，但这两条线平行或重合，交不出唯一的点。` +
+          `换两条确实相交的线，或直接给 ${obj.id} 写坐标。` +
+          candidateHint(d.l1, d.l2, pts),
+      });
+      continue;
+    }
+    const gap = Math.abs(dot3(sub3(C, A), n)) / nl;
+    if (gap > tol) {
+      issues.push({
+        level: 'error',
+        where: obj.id,
+        message:
+          `点 ${obj.id} 声明为「${pair} 的交点」，但这两条线是**异面**的` +
+          `（最短距离 ${gap.toFixed(3)}），根本没有交点——算出来的位置没有意义。` +
+          `检查这四点的坐标是否写错，或改用确实共面的两条线求交。` +
+          candidateHint(d.l1, d.l2, pts),
+      });
+    }
+  }
+  return issues;
+}
+
+/** 分句：按中文句读把一段讲解切成小句，逐句判断"是不是在说点" */
+const CLAUSE_SPLIT = /[。；;\n]/;
+/** 出现这些字才认为这句话在讲"某个点"（避免把「面积 S」当成点 S） */
+const POINT_CONTEXT = /[点交连延作取设过恰即]/;
+
+/**
+ * 步骤正文里点名的点，必须在图里真实存在。
+ *
+ * 真实事故（2026-11-06，正方体过 D、M、N 的截面）：板书逐行写着
+ * 「延长 DM 交 AA₁ 于 P」「PQ ∩ AB = R」「截面为五边形 MRNDS」，
+ * 但 P/Q/R/S 从来没在 objects 里声明过——图上只有 D、M、N。
+ * 用户看到的是"答案上写了四个点，图上凭空少四个"。
+ *
+ * 旧体检只看 steps[*].highlight/reveal 里的 id，**不看正文**，
+ * 所以这条一直是空的。现在补上，并且给出可执行的补法。
+ *
+ * 判定收得很紧，宁可漏也不误报：
+ *   · 只认"独立出现"的单字母（可带下标）——ABCD、A₁B₁ 这种连写不拆；
+ *   · 只在小句里出现「点/交/连/延长/作/取/设/过」等字时才当真（避开面积 S、体积 V）；
+ *   · 至少要有 3 个已声明顶点（否则不是点线图，别管）。
+ */
+function checkStepPointRefs(scene: Scene3D, pts: Map<string, V3>): Issue[] {
+  const steps = scene.steps ?? [];
+  if (steps.length === 0 || pts.size < 3) return [];
+
+  const declared = new Set<string>();
+  for (const o of scene.objects) {
+    if (o.type !== 'point3') continue;
+    declared.add(normalizeVertexToken(o.id));
+    if (typeof (o as { label?: unknown }).label === 'string') {
+      declared.add(normalizeVertexToken((o as { label: string }).label));
+    }
+  }
+
+  const issues: Issue[] = [];
+  steps.forEach((step, i) => {
+    const text = String(step.text ?? '');
+    const missing = new Set<string>();
+    for (const clause of text.split(CLAUSE_SPLIT)) {
+      if (!POINT_CONTEXT.test(clause)) continue;
+      const norm = normalizeVertexToken(clause);
+      // 独立出现的 大写字母 + 可选数字；前后不能粘连其它字母数字
+      const re = /(^|[^A-Za-z0-9])([A-Z]\d?)(?![A-Za-z0-9])/g;
+      for (const m of norm.matchAll(re)) {
+        const name = m[2];
+        if (!declared.has(name)) missing.add(name);
+      }
+    }
+    if (missing.size === 0) return;
+    const list = [...missing];
+    issues.push({
+      level: 'error',
+      where: `steps[${i}]`,
+      message:
+        `第 ${i + 1} 步的文字里点了 ${list.join('、')} 这几个点，但图里没有它们` +
+        `（objects 里声明的顶点是 ${[...declared].join('、')}）——` +
+        `读者会看到"讲解提到、图上找不到"。三选一：` +
+        `① 这些点确实要画：在 objects 里补 point3，用 derive 让程序算坐标` +
+        `（延长线交点用 intersect、中点用 midpoint、定比分点用 section），` +
+        `**线对必须挑本题里真实共面相交的两条线**——不要照抄报错里的示例，` +
+        `也不要手写坐标；` +
+        `② 只是文字里的记号：改成图上已有的顶点名；` +
+        `③ 不需要标到图上：把这句话删掉或改写，不要出现没画出来的点`,
+    });
+  });
+  return issues;
+}
+
 export function verifyScene3D(scene: Scene3D): Issue[] {
   const scope = defaultScope(scene);
   const { pts, issues: pointIssues } = collectPoints(scene, scope);
@@ -1089,6 +1420,9 @@ export function verifyScene3D(scene: Scene3D): Issue[] {
     ...checkFaces(scene, pts),
     ...solidSpecs.issues,
     ...checkSections(scene, pts, scope, solidSpecs.specs),
+    ...checkSectionClaims(scene),
+    ...checkIntersectDerives(scene, pts),
+    ...checkStepPointRefs(scene, pts),
     ...checkIsolatedPoints(scene, pts),
     ...checkConstraints(scene, pts, scope),
     ...checkReadouts(scene, scope),

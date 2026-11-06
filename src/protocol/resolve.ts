@@ -52,12 +52,27 @@ export function atParts(at: Vec2Like | undefined): Parts | null {
 }
 
 /**
+ * 把表达式里某个变量整体换成另一段表达式（按标识符整词替换）。
+ *
+ * 只替换**完整标识符**：`t` 会换，`tan(t)` 里的 `tan` 不会。
+ * 用在 curve-point 上——曲线定义里的 t（或 x）替换成点自己的参数。
+ */
+function substituteVar(expr: string, name: string, value: string): string {
+  return expr.replace(/[A-Za-z_][A-Za-z0-9_]*/g, (m) =>
+    m === name ? `(${value})` : m,
+  );
+}
+
+/**
  * 按 derive 声明生成坐标表达式。
  * 每个分支都是教科书公式，写成字符串——括号全部显式加满，避免优先级歧义。
+ *
+ * curveAt 负责"曲线上参数 t 处的坐标"，只对 curve-point 用得上。
  */
 function computeDerive(
   d: DeriveSpec,
   coordOf: (id: string) => Parts | null,
+  curveAt: (curveId: string, tExpr: string) => Parts | null,
 ): Parts | null {
   switch (d.kind) {
     case 'midpoint': {
@@ -103,6 +118,12 @@ function computeDerive(
       const k = String(d.t);
       return addE(A, scaleE(k, subE(B, A)));
     }
+    case 'curve-point': {
+      // 坐标直接取自曲线本身：曲线变（滑杆推参数），这个点跟着变
+      const t = typeof d.t === 'number' ? String(d.t) : String(d.t ?? '');
+      if (!t.trim()) return null;
+      return curveAt(String(d.curve ?? ''), t);
+    }
     default:
       return null;
   }
@@ -133,8 +154,43 @@ export function resolveScene(scene: Scene): Scene {
   }
   if (points.size === 0) return scene;
 
+  /** 按 id 索引所有对象：curve-point 要顺着曲线 id 找到曲线定义 */
+  const objsById = new Map<string, SceneObject>();
+  for (const o of scene.objects) objsById.set(o.id, o);
+
   const cache = new Map<string, Parts>();
   const visiting = new Set<string>();
+
+  /**
+   * 曲线在参数 t 处的坐标表达式。三种曲线各一套写法：
+   *   parametric → 把 xExpr/yExpr 里的 t 换掉
+   *   curve      → 把 expr 里的 x 换掉，横坐标就是 t
+   *   circle     → (cx + r·cos t, cy + r·sin t)
+   * 认不出的（线段、多边形……）返回 null，上层会把它写成 NaN 让体检器报错。
+   */
+  const curveAt = (curveId: string, tExpr: string): Parts | null => {
+    const obj = objsById.get(curveId?.trim());
+    if (!obj) return null;
+    if (obj.type === 'parametric') {
+      return [
+        substituteVar(String(obj.xExpr), 't', tExpr),
+        substituteVar(String(obj.yExpr), 't', tExpr),
+      ];
+    }
+    if (obj.type === 'curve') {
+      return [tExpr, substituteVar(String(obj.expr), 'x', tExpr)];
+    }
+    if (obj.type === 'circle') {
+      const c = atParts(obj.center) ?? coordOf(String(obj.center ?? ''));
+      if (!c) return null;
+      const r = String(obj.radius);
+      return [
+        `${p(c[0])} + ${p(r)} * cos(${tExpr})`,
+        `${p(c[1])} + ${p(r)} * sin(${tExpr})`,
+      ];
+    }
+    return null;
+  };
 
   const coordOf = (id: string): Parts | null => {
     const key = id?.trim();
@@ -146,7 +202,7 @@ export function resolveScene(scene: Scene): Scene {
     visiting.add(key);
     let parts: Parts | null = null;
     if (pt.derive) {
-      parts = computeDerive(pt.derive, coordOf);
+      parts = computeDerive(pt.derive, coordOf, curveAt);
     } else {
       parts = atParts(pt.at);
       // at 直接写成了另一个点的 id（"at": "A"）

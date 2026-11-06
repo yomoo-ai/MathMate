@@ -25,7 +25,7 @@ const OBJECT_TYPES_3D = [
   'sphere3',
   'section3',
 ];
-const DERIVE_KINDS = ['midpoint', 'centroid', 'section', 'foot', 'circumcenter', 'incenter'];
+const DERIVE_KINDS = ['midpoint', 'intersect', 'centroid', 'section', 'foot', 'circumcenter', 'incenter'];
 
 /** 点引用能不能用（顶点 id 字符串，或 "x, y, z" 坐标） */
 function pointRefProblem(v: unknown, field: string): string | null {
@@ -130,6 +130,11 @@ export function parseScene3D(input: string): ParseResult3D {
             }
             const bad =
               (d.kind === 'midpoint' && (typeof d.a !== 'string' || typeof d.b !== 'string')) ||
+              (d.kind === 'intersect' &&
+                (!Array.isArray(d.l1) ||
+                  d.l1.length !== 2 ||
+                  !Array.isArray(d.l2) ||
+                  d.l2.length !== 2)) ||
               (d.kind === 'centroid' &&
                 (!Array.isArray(d.points) || d.points.length !== 3)) ||
               ((d.kind === 'circumcenter' || d.kind === 'incenter') &&
@@ -143,6 +148,7 @@ export function parseScene3D(input: string): ParseResult3D {
             if (bad) {
               errors.push(
                 `objects[${i}]（point3）的 derive 缺少必要字段：midpoint 要 a/b，` +
+                  `intersect 要 l1[2] 和 l2[2]（两条直线各两个端点），` +
                   `centroid 要 points[3]，circumcenter/incenter 要 points[4]，` +
                   `section 要 a/b/t，foot 要 p 和 line[2]`,
               );

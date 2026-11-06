@@ -21,6 +21,7 @@ import { verifyScene, measureReadouts, type Issue } from '../protocol/verifier';
 import { verifyScene3D, measureReadouts3D } from '../protocol/verifier3d';
 import { buildSystemPrompt } from './prompt';
 import { buildSystemPrompt3D } from './prompt3d';
+import { autoFix3D } from '../protocol/autofix3d';
 
 /** 模型与接口配置。换服务商只改这里（保持 OpenAI 兼容格式即可） */
 const API_URL = '/llm-api/chat/completions'; // 经 vite 代理转发到 api.deepseek.com
@@ -148,6 +149,12 @@ export interface SceneKernel<T> {
   stepsOf: (scene: T) => Array<{ title: string; text: string }> | undefined;
   /** 复核用的事实材料（已声明的约束 + 图形实测值） */
   facts: (scene: T) => string;
+  /**
+   * 程序代改（可选）：体检发现错误后，先用程序能证明的答案直接修——
+   * 省一次模型调用，也避免"模型看着答案都抄不对"烧出 429。
+   * 只修程序能证明的（截面边数、交点、写反的比值），修不动原样返回。
+   */
+  autoFix?: (scene: T) => { scene: T; fixes: string[] };
 }
 
 /** 平面场景（原链路，行为完全不变） */
@@ -168,6 +175,7 @@ const KERNEL_3D: SceneKernel<Scene3D> = {
   verify: verifyScene3D,
   stepsOf: (s) => s.steps,
   facts: (s) => sceneFacts3D(s),
+  autoFix: autoFix3D,
 };
 
 // ---------------------------------------------------------------
@@ -183,6 +191,70 @@ const KERNEL_3D: SceneKernel<Scene3D> = {
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 429 不是一种故障，而是四种，处理方式完全相反：
+ *   - insufficient_balance → 账户没钱了，等一万年也不会好，只能去充值；
+ *   - quota_exceeded       → 当日/当月额度用尽，得等重置或充值；
+ *   - rate limit           → 真的只是发太快，等几十秒再试就好；
+ *   - 什么都不写           → 按限流处理（最保守）。
+ *
+ * 服务商把原因写在响应体里（OpenAI 兼容格式的 error.message / error.code），
+ * 所以这里必须解析 body，光看状态码分不出来——用户看到的就是
+ * "明明还有余额，为什么一直 429" 或者 "一直等重试，其实是没钱了"。
+ */
+function explain429(
+  body: string,
+  label: string,
+): { transient: boolean; message: string } {
+  const b = body.toLowerCase();
+  const site = /deepseek/i.test(label) ? 'platform.deepseek.com' : 'open.bigmodel.cn';
+
+  if (/insufficient|balance|余额/.test(b)) {
+    return {
+      transient: false,
+      message:
+        `${label} 账户余额不足（429 insufficient_balance）——这不是限流，重试一百次也一样。\n` +
+        `请打开 ${site} 充值，余额到账（通常即时）后再点一次。\n` +
+        '提示：赠送余额和充值余额是分开扣的，先看页面上的余额数字是不是 0。',
+    };
+  }
+  if (/quota/.test(b)) {
+    return {
+      transient: false,
+      message:
+        `${label} 账号的额度/配额已经用完（429 quota_exceeded）。\n` +
+        `去 ${site} 看看额度详情，等重置或充值后再试。`,
+    };
+  }
+  return {
+    transient: true,
+    message:
+      `${label} 请求被限流（429，同一时刻的请求太多或触发了速率上限）。\n` +
+      '等 30 秒再点一次即可；等待期间别连续点按钮——连点会让限流窗口一直续上，越点越久。\n' +
+      '（浏览器控制台那条红色的 429 是浏览器自己记的账，重试成功也会留着，不用管它。）',
+  };
+}
+
+// ---------------------------------------------------------------
+// 请求节流：两次出网请求之间至少隔 MIN_REQUEST_GAP_MS
+//
+// 为什么需要：一道题的生成不是一次调用——生成 → 数值体检 → 带着错误重写
+// → 证明复核，串下来 4~6 次请求。账号若按「每分钟 N 次」限流，这么一串
+// 打过去很容易撞 429；更糟的是**每次重试又占一个额度**，于是越重试越撞，
+// 用户看到的就是「重试了还是 429」。
+// 强制拉开间隔，总耗时只多几秒，换的是「不再整次失败」。
+//
+// 注意这是全局节流（含视觉转录），因为图文两条链路共用同一个账号额度。
+// ---------------------------------------------------------------
+const MIN_REQUEST_GAP_MS = 1500;
+let lastRequestAt = 0;
+
+async function throttle(): Promise<void> {
+  const wait = lastRequestAt + MIN_REQUEST_GAP_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastRequestAt = Date.now();
+}
+
 async function fetchWithRetry(
   url: string,
   init: RequestInit,
@@ -192,6 +264,7 @@ async function fetchWithRetry(
 ): Promise<Response> {
   let lastError: Error | null = null;
   for (let i = 1; i <= tries; i++) {
+    await throttle();
     let res: Response;
     try {
       res = await fetch(url, init);
@@ -211,6 +284,16 @@ async function fetchWithRetry(
     lastError = new Error(`${label} 返回 ${res.status}：${body.slice(0, 300)}`);
 
     if (!RETRYABLE_STATUS.has(res.status)) throw lastError;
+
+    // 429 先分清是「没钱」还是「太快」：没钱就立刻停，重试只会白等三次
+    if (res.status === 429) {
+      const info = explain429(body, label);
+      if (!info.transient) throw new Error(info.message);
+      lastError = new Error(info.message);
+      // 原始响应留在过程日志里——真出问题时得看服务商到底说了什么
+      onProgress?.(`   ${label} 429 原始响应：${body.slice(0, 180).replace(/\s+/g, ' ')}`);
+    }
+
     if (i === tries) throw lastError;
 
     // 服务端给了 Retry-After 就照它等，否则退避。
@@ -222,11 +305,11 @@ async function fetchWithRetry(
     // 加抖动是因为多个请求同时退避会踩同一时刻重发，又撞一起。
     const ra = Number(res.headers.get('retry-after'));
     const jitter = Math.random() * 400;
-    const base = res.status === 429 ? 3000 : 1000;
+    const base = res.status === 429 ? 4000 : 1000;
     const wait =
       isFinite(ra) && ra > 0
-        ? Math.min(ra * 1000, 15000)
-        : Math.min(base * i + jitter, 15000);
+        ? Math.min(ra * 1000, 20000)
+        : Math.min(base * i + jitter, 20000);
     onProgress?.(
       `   ${label} 被限流（${res.status}），${(wait / 1000).toFixed(1)}s 后自动重试（第 ${i}/${tries - 1} 次）……`,
     );
@@ -323,16 +406,9 @@ export async function transcribeImage(
       relay(`   ${ep.model} 不可用（${lastError.message.slice(0, 120)}），尝试下一个……`);
     }
   }
-  // 最后一道关口：如果全线溃败在 429 上，就别把原始 HTTP 文本甩给用户。
-  // 429 不是"坏了"，是"排队的人太多"——他要做的是等一会儿、别连点。
-  if (lastError && /返回 429/.test(lastError.message)) {
-    throw new Error(
-      '识别被限流了（429，服务商的并发/频率限制，不是你的 Key 有问题）。\n' +
-        '等 20～30 秒再点一次「识别题目」即可；等待期间别重复点击，' +
-        '连点只会让限流窗口一直续上。\n' +
-        '控制台里那条红色 429 是浏览器自己记的账，重试成功也会留着，不用管它。',
-    );
-  }
+  // 全线溃败时把 lastError 原样抛出即可——429 / 余额不足的文案
+  // 已经在 explain429 里翻译成人话了，这里不用再包一层（包了反而会
+  // 把"余额不足"误说成"只是限流"）。
   throw lastError ?? new Error('所有识别模型都没能识别这张图');
 }
 
@@ -540,7 +616,7 @@ function extractJson(text: string): string {
 }
 
 /** 调一次对话接口，返回模型输出的文本 */
-async function callChat(
+export async function callChat(
   messages: Array<{ role: string; content: string }>,
   onProgress?: ProgressFn,
 ): Promise<string> {
@@ -619,6 +695,68 @@ async function runGeneration<T>(
   // 真实案例：模型连续两轮把 DF 用 tan30° 算成 2.89（正确 sin30°=2.5），
   // 只给 1 次机会时第二轮的错误直接放行——数值类错误多给一轮通常能改对。
   let proofRetries = 0;
+  // 上一轮数值体检的错误签名（原地打转检测用）
+  let lastErrorsSig = '';
+
+  /**
+   * 放行 + 证明复核（正常通过和程序代改通过走同一条路）。
+   * 返回 null 表示复核发现问题且已排好重试消息，外层 continue 下一轮。
+   */
+  const acceptAndReview = async (
+    accepted: T,
+    warns: Issue[],
+    passMsg: string,
+    attempt: number,
+    lastText: string,
+  ): Promise<T | null> => {
+    onProgress?.(passMsg);
+    for (const w of warns) onProgress?.(`   ⚠ 提醒：${w.where}：${w.message}`);
+
+    // 第三道关：证明复核（只读文字判断，数值体检管不到）
+    const steps = kernel.stepsOf(accepted);
+    if (steps && steps.length > 0) {
+      onProgress?.('→ 正在复核分步讲解的数学正确性……');
+      const stepsText = steps.map((s, i) => `第${i + 1}步（${s.title}）：${s.text}`).join('\n');
+      const review = await reviewProof(prompt, stepsText, kernel.facts(accepted));
+      // 自检撤回的误报也打出来——让你看见"这条质疑被判定为误报"
+      for (const w of review.withdrawn) {
+        onProgress?.(`   ↩ 已撤回误报：${w}`);
+      }
+      if (!review.ok) {
+        onProgress?.(`✗ 证明复核发现问题（${review.problems.length} 处）：`);
+        for (const p of review.problems) onProgress?.(`   · ${p}`);
+
+        // 还有修正名额就打回重做
+        if (proofRetries < 2 && attempt < MAX_ATTEMPTS) {
+          proofRetries++;
+          messages.push({ role: 'assistant', content: lastText });
+          messages.push({
+            role: 'user',
+            content:
+              `你输出的 JSON 格式与数值都没问题，但分步讲解的数学内容被复核判定有误：\n${review.problems
+                .map((p) => `- ${p}`)
+                .join('\n')}\n请修正 steps 里的推理（不要改图形结构），重新输出完整 JSON。`,
+          });
+          onIssues?.(
+            review.problems.map((p) => ({ level: 'error' as const, where: 'steps', message: p })),
+          );
+          return null;
+        }
+
+        // 已重试过：放行，但把疑点降级为提醒留在报告里，由你人工核对
+        onProgress?.('   （复核只给一次修正机会，放行并在报告里保留疑点）');
+        onIssues?.([
+          ...warns,
+          ...review.problems.map((p) => ({ level: 'warn' as const, where: 'steps', message: p })),
+        ]);
+        return accepted;
+      }
+      onProgress?.('✓ 证明复核通过');
+    }
+
+    onIssues?.(warns);
+    return accepted;
+  };
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     onProgress?.(
@@ -665,6 +803,65 @@ async function runGeneration<T>(
       // 被打回的这轮也把报告抛给 UI——用户能看见"模型第几次错在哪"
       onIssues?.(issues);
 
+      // 原地打转检测：模型连续两轮输出**完全相同**的错误集合，说明它
+      // 在照抄自己——继续重试只是烧调用（实测第 2、3 轮一字不差，还烧出 429）。
+      // 提前止损，把"换种描述"的建议直接给用户。
+      const errSig = errors.map((e) => `${e.where}|${e.message}`).join('\n');
+      if (errSig === lastErrorsSig) {
+        throw new Error(
+          `模型连续两轮输出完全相同的错误（在原地打转），已提前停止以免继续浪费调用：\n` +
+            `${formatIssues(errors)}\n` +
+            `建议：换一种描述再试——把关键点（交点、分点）在题面里的来历写得更明确，` +
+            `或把题目原文贴全。`,
+        );
+      }
+      lastErrorsSig = errSig;
+
+      // 优先程序代改：体检错误里有一类是程序自己已经算出正确答案的
+      // （截面边数、延长线交点、写反的比值），退回模型等于让它"抄答案"，
+      // 实测抄不对还烧调用（连续 3 轮裁在同一批错上 → 429）。
+      // 这里先用程序修，修完重新体检，过了就直接放行——一次模型调用都不花。
+      if (kernel.autoFix) {
+        const fixed = kernel.autoFix(scene);
+        if (fixed.fixes.length > 0) {
+          const issues2 = kernel.verify(fixed.scene);
+          const errors2 = issues2.filter((i) => i.level === 'error');
+          if (errors2.length === 0) {
+            onProgress?.(`🔧 程序代改了 ${fixed.fixes.length} 处（没有调用模型）：`);
+            for (const f of fixed.fixes) onProgress?.(`   · ${f}`);
+            const res = await acceptAndReview(
+              fixed.scene,
+              issues2.filter((i) => i.level === 'warn'),
+              '✓ 代改后通过校验与数值体检',
+              attempt,
+              text,
+            );
+            if (res) return res;
+            continue;
+          }
+          // 部分修好：以代改稿为基底回传，只让模型修剩余问题。
+          // 教训（2026-11-06 实测）：把代改结果整个丢掉、让模型从零重写，
+          // 它会把已修好的（写反的比值）又写错——第 2、3 轮错误一字不差，
+          // 原地打转。基底换成代改稿后，修好的部分不会反弹。
+          onProgress?.(
+            `   （程序代改了 ${fixed.fixes.length} 处，还剩 ${errors2.length} 处修不动——以代改稿为基底回传模型）`,
+          );
+          for (const f of fixed.fixes) onProgress?.(`      · 已代改：${f}`);
+          if (attempt < MAX_ATTEMPTS) {
+            messages.push({ role: 'assistant', content: JSON.stringify(fixed.scene) });
+            messages.push({
+              role: 'user',
+              content:
+                `上面的 JSON 已由程序代改了 ${fixed.fixes.length} 处（不要改动这些地方）：\n` +
+                `${fixed.fixes.map((f) => `- ${f}`).join('\n')}\n` +
+                `数值体检仍发现以下 ${errors2.length} 处程序修不动的问题，请只修这几处，` +
+                `其余内容保持原样，重新输出完整 JSON：\n${formatIssues(errors2)}`,
+            });
+            continue;
+          }
+        }
+      }
+
       if (attempt < MAX_ATTEMPTS) {
         messages.push({ role: 'assistant', content: text });
         messages.push({
@@ -676,59 +873,29 @@ ${formatIssues(issues)}
         });
         continue;
       }
+
+      // 唯一的错是"说要画图却一个对象都没画"：别把整次生成丢掉。
+      // steps 是好的，把场景降级成推导板书照样能用——空白坐标轴才是最糟的结果。
+      if (errors.every((e) => e.where === 'visual')) {
+        onProgress?.('✓ 本题没有可对应的图形，已改用推导板书');
+        onIssues?.(warns);
+        return { ...scene, visual: 'board', objects: [] };
+      }
+
       throw new Error(`连续 ${MAX_ATTEMPTS} 次未通过数值体检：\n${formatIssues(errors)}`);
     }
 
     // error 清零 = 放行。warn 不拦截，但报告照样抛给 UI 展示。
-    onProgress?.(
+    // （放行 + 证明复核抽成了 acceptAndReview，正常通过和程序代改共用一条路）
+    const res = await acceptAndReview(
+      scene,
+      warns,
       attempt === 1 ? '✓ 一次通过校验与数值体检' : `✓ 第 ${attempt} 次通过校验与数值体检`,
+      attempt,
+      text,
     );
-    for (const w of warns) onProgress?.(`   ⚠ 提醒：${w.where}：${w.message}`);
-
-    // 第三道关：证明复核（只读文字判断，数值体检管不到）
-    const steps = kernel.stepsOf(scene);
-    if (steps && steps.length > 0) {
-      onProgress?.('→ 正在复核分步讲解的数学正确性……');
-      const stepsText = steps.map((s, i) => `第${i + 1}步（${s.title}）：${s.text}`).join('\n');
-      const review = await reviewProof(prompt, stepsText, kernel.facts(scene));
-      // 自检撤回的误报也打出来——让你看见"这条质疑被判定为误报"
-      for (const w of review.withdrawn) {
-        onProgress?.(`   ↩ 已撤回误报：${w}`);
-      }
-      if (!review.ok) {
-        onProgress?.(`✗ 证明复核发现问题（${review.problems.length} 处）：`);
-        for (const p of review.problems) onProgress?.(`   · ${p}`);
-
-        // 还有修正名额就打回重做
-        if (proofRetries < 2 && attempt < MAX_ATTEMPTS) {
-          proofRetries++;
-          messages.push({ role: 'assistant', content: text });
-          messages.push({
-            role: 'user',
-            content:
-              `你输出的 JSON 格式与数值都没问题，但分步讲解的数学内容被复核判定有误：\n${review.problems
-                .map((p) => `- ${p}`)
-                .join('\n')}\n请修正 steps 里的推理（不要改图形结构），重新输出完整 JSON。`,
-          });
-          onIssues?.(
-            review.problems.map((p) => ({ level: 'error' as const, where: 'steps', message: p })),
-          );
-          continue;
-        }
-
-        // 已重试过：放行，但把疑点降级为提醒留在报告里，由你人工核对
-        onProgress?.('   （复核只给一次修正机会，放行并在报告里保留疑点）');
-        onIssues?.([
-          ...warns,
-          ...review.problems.map((p) => ({ level: 'warn' as const, where: 'steps', message: p })),
-        ]);
-        return scene;
-      }
-      onProgress?.('✓ 证明复核通过');
-    }
-
-    onIssues?.(warns);
-    return scene;
+    if (res) return res;
+    continue;
   }
 
   throw new Error(`连续 ${MAX_ATTEMPTS} 次都未通过校验，请换一种描述再试。`);
