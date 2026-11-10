@@ -38,6 +38,7 @@ import {
 } from '../protocol/sectionMath';
 import { makeTextSprite } from './textSprite';
 import type { AnnotationMark3D } from './annotations3d';
+import { foldExtent, foldPositions, planFold, type FoldPlan } from '../protocol/fold3d';
 import {
   axisFrame,
   solidCenter,
@@ -120,6 +121,8 @@ interface FaceItem {
   mat: THREE.MeshLambertMaterial;
   /** 对应的 face3 对象 id */
   id: string;
+  /** 顶点 id 列表——折起时顶点会动，几何要按它重算 */
+  pids: string[];
   /** 面中心（three 坐标） */
   center: THREE.Vector3;
   /** 规范化后的顶点 id 对，用于找"这条棱的邻接面" */
@@ -192,7 +195,17 @@ export class Scene3DRenderer {
   private pointMeshes: THREE.Mesh[] = [];
   /** 标签：记录锚点世界坐标，位置在每帧按屏幕方向重算 */
   /** 标签：id 是它所属对象的 id，步骤渐显/压暗时要跟着一起变 */
-  private labels: { sprite: THREE.Sprite; anchor: THREE.Vector3; id: string }[] = [];
+  private labels: {
+    sprite: THREE.Sprite;
+    anchor: THREE.Vector3;
+    id: string;
+    /**
+     * 锚点怎么来的：挂在哪几个顶点上、再加多少偏移。
+     * 折起时顶点会动，标签必须跟着重算——不留这份来源，就只能让字母
+     * 留在原地等棱转走（真实事故：折起来以后字母全飘在空中）。
+     */
+    src?: { pids: string[]; off: Vec3 };
+  }[] = [];
 
   // ---- 旋转体（圆柱 / 圆锥 / 球）----
   /** 解析好的旋转体参数（半径、轴端点都算成数字了） */
@@ -244,12 +257,34 @@ export class Scene3DRenderer {
     toTarget: THREE.Vector3;
     fromDist: number;
     toDist: number;
+    /**
+     * 方位角/仰角补间：只有"转到某个视角"才给。
+     * 分步运镜（flyToHighlight）刻意不转角度——旋转容易让人晕，
+     * 但"讲底面就要转到能看见底面"这件事，只能靠转。
+     */
+    fromAz?: number;
+    toAz?: number;
+    fromEl?: number;
+    toEl?: number;
     start: number;
     duration: number;
   } | null = null;
 
   private data: Scene3D | null = null;
   private params: Record<string, number> = {};
+
+  // ---- 翻折（折起）----
+  //
+  // 场景里的坐标是**折好之后**的样子；播放器要在某一句把 moving 那块平面
+  // 从"完全展开"折到声明的位置，所以这里存的是一份折起计划 + 当前角度偏移。
+  // offset 语义：0 = 场景原样（折好），−deg = 完全展开。
+  //
+  // 为什么每帧不重跑 setScene？那里面要建点、建面、建棱、建标签、量尺寸、
+  // 拟合相机，一套下来几百次对象分配；一秒 60 帧就是几万个垃圾对象，
+  // 这台机器（i5-1035G1 + 核显）会直接掉到个位数帧率。
+  // 所以折起走"只改动了的那几个顶点 + 就地重写依赖它们的几何"。
+  private fold: FoldPlan | null = null;
+  private foldOffset = 0;
 
   /**
    * 讲解视频的"红笔标注"层：本句的角度弧/直角方块/长度记号。
@@ -377,6 +412,13 @@ export class Scene3DRenderer {
     for (const obj of data.objects) {
       if (obj.type === 'point3') this.buildPoint(obj as Point3Object);
     }
+    // 翻折：顶点求值完就能核计划了。截面的、旋转体的题一律不演——
+    // 它们的几何每帧都要按顶点重算，点一动就画歪（体检器也会提示这一点）
+    const blocked = data.objects.some((o) => o.type === 'section3' || isCurved3(o));
+    this.fold = blocked ? null : planFold(data.fold, this.points).plan;
+    this.foldOffset = 0;
+    // 换场景时把上一题的运镜掐掉：不然新题一打开就被旧补间拽着转
+    this.camTween = null;
     // 旋转体的圆心可以是顶点 id，所以必须等点都求值完再解析
     this.resolveSolids();
     // 截面要切谁（旋转体 id 或多面体顶点集合）也要在这里定下来
@@ -557,6 +599,86 @@ export class Scene3DRenderer {
     return this.buildMap.get(id) ?? FULL_BUILD;
   }
 
+  // -------------------------------------------------------------
+  // 折起（翻折）
+  // -------------------------------------------------------------
+
+  /** 这一场有没有可演的翻折（没有的话播放器就不用管 fold 动作） */
+  hasFold(): boolean {
+    return this.fold !== null;
+  }
+
+  /**
+   * 把折起演到某个角度。
+   *
+   * 参数是**相对声明状态的偏移**：0 = 场景原样（折好），
+   * flatOffset（可能是 +deg 也可能是 −deg）= 完全展开。
+   * 播放器从 flatOffset 一路推到 0，就是"把折起来的纸摊开→再折回去"那一段。
+   *
+   * 只改动了的顶点和依赖它们的几何，不重建整张图——见字段区的性能说明。
+   */
+  setFoldOffset(offset: number) {
+    const plan = this.fold;
+    if (!plan) return;
+    const lo = Math.min(0, plan.flatOffset);
+    const hi = Math.max(0, plan.flatOffset);
+    const next = Math.max(lo, Math.min(hi, offset));
+    // 小于千分之一度看不出区别，但每帧都会重写十条棱的顶点缓冲，划不来
+    if (Math.abs(next - this.foldOffset) < 1e-3) return;
+    this.foldOffset = next;
+    const moved = foldPositions(plan, next);
+    for (const [id, p] of moved) this.points.set(id, p);
+    this.refreshAfterFold(moved);
+  }
+
+  /**
+   * 完全展开对应的偏移量（±deg）。播放器要拿它当折起的起点。
+   * 没有翻折时返回 0。
+   */
+  foldFlatOffset(): number {
+    return this.fold ? this.fold.flatOffset : 0;
+  }
+
+  /** 折起后把依赖这些顶点的东西就地重写（棱 / 点 / 面 / 标签） */
+  private refreshAfterFold(moved: Map<string, Vec3>) {
+    for (const e of this.edges) {
+      if (!moved.has(e.a) && !moved.has(e.b)) continue;
+      // grow 沿用入场构建的进度：万一折起和入场撞在一起，棱不会突然变全长
+      this.rewriteEdge(e, this.buildOf(e.id).grow);
+    }
+    for (const [id, mesh] of this.pointMeshById) {
+      const p = moved.get(id);
+      if (p) mesh.position.copy(toV3(p));
+    }
+    for (const f of this.faces) {
+      if (!f.pids.some((id) => moved.has(id))) continue;
+      this.writeFaceGeometry(f);
+    }
+    this.updateLabelAnchors(moved);
+    this.dirty = true;
+  }
+
+  /** 标签锚点跟着顶点走：折起来以后字母不能留在原地等棱转走 */
+  private updateLabelAnchors(moved: Map<string, Vec3>) {
+    for (const l of this.labels) {
+      const src = l.src;
+      if (!src) continue;
+      if (!src.pids.some((id) => moved.has(id))) continue;
+      const ps = src.pids.map((id) => this.points.get(id)).filter(Boolean) as Vec3[];
+      if (ps.length === 0) continue;
+      const mean: Vec3 = [0, 0, 0];
+      for (const p of ps) {
+        mean[0] += p[0];
+        mean[1] += p[1];
+        mean[2] += p[2];
+      }
+      mean[0] /= ps.length;
+      mean[1] /= ps.length;
+      mean[2] /= ps.length;
+      l.anchor.copy(toV3(mean)).add(toV3(src.off));
+    }
+  }
+
   /** 把一条棱画成"从 a 出发已走 t 比例"的样子（t=1 即整条） */
   private rewriteEdge(e: EdgeItem, t: number) {
     const pa = this.points.get(e.a);
@@ -641,8 +763,99 @@ export class Scene3DRenderer {
       k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
     this.target.lerpVectors(tw.fromTarget, tw.toTarget, e);
     this.distance = tw.fromDist + (tw.toDist - tw.fromDist) * e;
+    if (tw.toAz !== undefined && tw.fromAz !== undefined) {
+      this.azimuth = tw.fromAz + (tw.toAz - tw.fromAz) * e;
+      this.onViewChange?.(this.azimuth, this.elevation);
+    }
+    if (tw.toEl !== undefined && tw.fromEl !== undefined) {
+      this.elevation = tw.fromEl + (tw.toEl - tw.fromEl) * e;
+    }
     this.dirty = true;
-    if (k >= 1) this.camTween = null;
+    if (k >= 1) {
+      this.camTween = null;
+      // 转完把方位角折算回 [0,360)：不然连转几圈以后数字会越来越大，
+      // 自动旋转那边的取模也跟着飘
+      this.azimuth = ((this.azimuth % 360) + 360) % 360;
+      this.dirty = true;
+    }
+  }
+
+  /** 当前视角（播放器算"只转仰角/只转方位角"时要用） */
+  currentAzimuth(): number {
+    return this.azimuth;
+  }
+
+  currentElevation(): number {
+    return this.elevation;
+  }
+
+  /**
+   * 平滑转到指定视角（方位角 / 仰角，度）。讲解视频的 view 动作用它。
+   *
+   * 方位角走**最短弧**：从 350° 转到 10° 应该转 +20°，而不是 −340°。
+   * 不处理这件事的话，跨 0° 的一次转向会让画面原地高速转一圈。
+   */
+  turnTo(azimuth: number, elevation: number, duration = 1200) {
+    const el = Math.max(-89, Math.min(89, elevation));
+    const delta = (((azimuth - this.azimuth) % 360) + 540) % 360 - 180;
+    this.camTween = {
+      fromTarget: this.target.clone(),
+      toTarget: this.target.clone(),
+      fromDist: this.distance,
+      toDist: this.distance,
+      fromAz: this.azimuth,
+      toAz: this.azimuth + delta,
+      fromEl: this.elevation,
+      toEl: el,
+      start: performance.now(),
+      duration: Math.max(1, duration),
+    };
+    this.dirty = true;
+  }
+
+  /**
+   * 转到正对某个面。返回 false = 这个 id 不是面（或顶点算不出来）。
+   *
+   * 为什么要专门做这件事：讲"看底面 ABCD"时，默认视角往往只能看到底面的一条缝，
+   * 学生根本没法把"底面是正方形"和眼前这团东西对上。转过去看是唯一解法。
+   *
+   * 朝哪一侧看？面有两个法向，取"背离场景中心"的那一个——
+   * 那才是外表面、也是课本上画着的那一面。
+   */
+  turnToFace(id: string, duration = 1200): boolean {
+    const f = this.faces.find((x) => x.id === id);
+    if (!f || f.pids.length < 3) return false;
+    const ps = f.pids.map((pid) => this.points.get(pid)).filter(Boolean) as Vec3[];
+    if (ps.length < 3) return false;
+    const v = ps.map(toV3);
+    const n = new THREE.Vector3()
+      .subVectors(v[1], v[0])
+      .cross(new THREE.Vector3().subVectors(v[2], v[0]));
+    if (n.lengthSq() < 1e-12) return false;
+    n.normalize();
+    // 朝外：面心相对场景中心的方向
+    if (n.dot(f.center.clone().sub(this.sceneCenter)) < 0) n.negate();
+
+    const el = (Math.asin(Math.max(-1, Math.min(1, n.y))) * 180) / Math.PI;
+    // 正上/正下方时方位角无从判断（sin/cos 都退化），保持当前方位角
+    const flat = Math.hypot(n.x, n.z);
+    const az = flat < 1e-6 ? this.azimuth : (Math.atan2(n.x, n.z) * 180) / Math.PI;
+
+    const delta = (((az - this.azimuth) % 360) + 540) % 360 - 180;
+    this.camTween = {
+      fromTarget: this.target.clone(),
+      toTarget: f.center.clone(),
+      fromDist: this.distance,
+      toDist: this.distance,
+      fromAz: this.azimuth,
+      toAz: this.azimuth + delta,
+      fromEl: this.elevation,
+      toEl: Math.max(-89, Math.min(89, el)),
+      start: performance.now(),
+      duration: Math.max(1, duration),
+    };
+    this.dirty = true;
+    return true;
   }
 
   /**
@@ -845,6 +1058,8 @@ export class Scene3DRenderer {
     const geo = new THREE.SphereGeometry(r, 14, 10);
     for (const obj of this.data?.objects ?? []) {
       if (obj.type !== 'point3') continue;
+      // hidden 的点只提供坐标（折前的位置、折叠计算的输入），画面上不该有球
+      if ((obj as Point3Object).hidden) continue;
       const p = this.points.get(obj.id);
       if (!p) continue;
       const mat = new THREE.MeshBasicMaterial({ color: obj.color ?? COLORS.point });
@@ -858,10 +1073,55 @@ export class Scene3DRenderer {
   }
 
   private buildFace(obj: Face3Object) {
-    const pts = obj.points.map((id) => this.points.get(id)).filter(Boolean) as Vec3[];
-    if (pts.length < 3) return;
+    const ids = obj.points.filter((id) => this.points.has(id));
+    if (ids.length < 3) return;
 
-    const verts = pts.map(toV3);
+    const opacity = obj.opacity ?? 0.16;
+    const mat = new THREE.MeshLambertMaterial({
+      color: obj.color ? new THREE.Color(obj.color) : COLORS.face,
+      transparent: true,
+      opacity,
+      side: THREE.DoubleSide,
+      // 关掉深度写入：半透明的面不该挡住后面的棱，
+      // 棱的虚实是几何算出来的（见文件头），不靠渲染遮挡
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(new THREE.BufferGeometry(), mat);
+    this.contentGroup.add(mesh);
+    this.register(obj.id, mesh);
+
+    const edges = new Set<string>();
+    for (let i = 0; i < obj.points.length; i++) {
+      edges.add(edgeKey(obj.points[i], obj.points[(i + 1) % obj.points.length]));
+    }
+    const item: FaceItem = {
+      mesh,
+      mat,
+      id: obj.id,
+      pids: ids,
+      center: new THREE.Vector3(),
+      edges,
+      opacity,
+      dim: false,
+      buildAlpha: 1,
+    };
+    this.faces.push(item);
+    this.writeFaceGeometry(item);
+  }
+
+  /**
+   * 按当前顶点位置重写一个面的几何（三角扇 + 朝外的法线）。
+   *
+   * 抽出来是因为它有两个调用方：初次建面、折起时逐帧重写。
+   * 折起那条路只在顶点真的动了的时候才走，一秒几十次，
+   * 所以每帧换一块新的 BufferGeometry 并把旧的 dispose 掉——
+   * 在旧几何上 setAttribute 会把顶点缓冲换掉却留下旧的 GPU 缓冲，转两秒就积一堆。
+   */
+  private writeFaceGeometry(f: FaceItem) {
+    const ps = f.pids.map((id) => this.points.get(id)).filter(Boolean) as Vec3[];
+    if (ps.length < 3) return;
+    const verts = ps.map(toV3);
+
     const center = new THREE.Vector3();
     for (const v of verts) center.add(v);
     center.multiplyScalar(1 / verts.length);
@@ -877,32 +1137,17 @@ export class Scene3DRenderer {
     // 后者按顶点绕序算，绕序一反法线就朝里，整个面的光照全塌成环境光
     // （实测表现就是三个面一样亮、看不出立体）。多面体的面都是平面，
     // 法线方向只有"从形心朝外"这一个正确答案，绕序不该参与决定。
-    const outward = center.clone().sub(this.target).normalize();
+    const outward = center.clone().sub(this.sceneCenter).normalize();
     const normals: number[] = [];
     for (let i = 0; i < positions.length / 3; i++) {
       normals.push(outward.x, outward.y, outward.z);
     }
     geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
 
-    const opacity = obj.opacity ?? 0.16;
-    const mat = new THREE.MeshLambertMaterial({
-      color: obj.color ? new THREE.Color(obj.color) : COLORS.face,
-      transparent: true,
-      opacity,
-      side: THREE.DoubleSide,
-      // 关掉深度写入：半透明的面不该挡住后面的棱，
-      // 棱的虚实是几何算出来的（见文件头），不靠渲染遮挡
-      depthWrite: false,
-    });
-    const mesh = new THREE.Mesh(geo, mat);
-    this.contentGroup.add(mesh);
-    this.register(obj.id, mesh);
-
-    const edges = new Set<string>();
-    for (let i = 0; i < obj.points.length; i++) {
-      edges.add(edgeKey(obj.points[i], obj.points[(i + 1) % obj.points.length]));
-    }
-    this.faces.push({ mesh, mat, id: obj.id, center, edges, opacity, dim: false, buildAlpha: 1 });
+    const old = f.mesh.geometry;
+    f.mesh.geometry = geo;
+    old?.dispose();
+    f.center.copy(center);
   }
 
   private buildEdge(obj: Edge3Object) {
@@ -947,7 +1192,12 @@ export class Scene3DRenderer {
       const s = this.makeLabel(obj.label, obj.color);
       const anchor = mid.clone().add(toV3(off as Vec3));
       this.labelGroup.add(s);
-      this.labels.push({ sprite: s, anchor, id: obj.id });
+      this.labels.push({
+        sprite: s,
+        anchor,
+        id: obj.id,
+        src: { pids: [obj.a, obj.b], off: off as Vec3 },
+      });
       this.register(obj.id, s);
     }
   }
@@ -1435,6 +1685,7 @@ export class Scene3DRenderer {
     if (!this.data) return;
     for (const obj of this.data.objects) {
       if (obj.type !== 'point3' || !obj.label) continue;
+      if ((obj as Point3Object).hidden) continue;
       const p = this.points.get(obj.id);
       if (!p) continue;
       const off = obj.labelOffset ?? [0, 0, 0];
@@ -1443,7 +1694,12 @@ export class Scene3DRenderer {
       // 普通顶点没给 color，仍用默认深灰。
       const s = this.makeLabel(obj.label, obj.color);
       this.labelGroup.add(s);
-      this.labels.push({ sprite: s, anchor, id: obj.id });
+      this.labels.push({
+        sprite: s,
+        anchor,
+        id: obj.id,
+        src: { pids: [obj.id], off: off as Vec3 },
+      });
       // 标签也要挂到 id 名下：否则 reveal 把顶点藏了，字母还留在原地
       this.register(obj.id, s);
     }
@@ -1526,8 +1782,22 @@ export class Scene3DRenderer {
    * 半径则必须用**极值点**（含圆周采样），否则圆柱会被画面裁掉。
    */
   private measure() {
-    const centers: THREE.Vector3[] = [...this.points.values()].map((p) => toV3(p));
+    // hidden 点不算进取景：折前那块摊平的位置往往比折好的图"探出去"一截，
+    // 拿它量包围盒会把整个画面压小。展开态的尺寸由下面的 foldExtent 负责。
+    const hidden = new Set(
+      (this.data?.objects ?? [])
+        .filter((o) => o.type === 'point3' && (o as Point3Object).hidden)
+        .map((o) => o.id),
+    );
+    const centers: THREE.Vector3[] = [...this.points.entries()]
+      .filter(([id]) => !hidden.has(id))
+      .map(([, p]) => toV3(p));
     const extents: THREE.Vector3[] = [...centers];
+    // 折起题：取景要按"完全展开"那一片算。展开态通常比折好态横向更宽，
+    // 只按折好态取景的话，视频开头（还没折）那块平面会被裁掉一角。
+    if (this.fold) {
+      for (const p of foldExtent(this.fold)) extents.push(toV3(p));
+    }
     for (const g of this.solidGeoms) {
       centers.push(solidCenter(g));
       extents.push(...solidExtentPoints(g));

@@ -69,6 +69,53 @@ export function atParts3(at: Vec3Like | undefined): Tri | null {
 }
 
 /**
+ * 绕直线 c1c2 转 deg 度（数值版，只用来定方向）。
+ * 公式是 Rodrigues：v 分解成"沿轴"和"垂直轴"两部分，垂直那部分在
+ * 垂直于轴的平面内转 θ，方向由 u × v 给出。
+ */
+function rotAboutNumeric(a: Vec3, c1: Vec3, c2: Vec3, deg: number, sign: number): Vec3 {
+  const ax = [c2[0] - c1[0], c2[1] - c1[1], c2[2] - c1[2]];
+  const L = Math.hypot(ax[0], ax[1], ax[2]);
+  if (!(L > 1e-12)) return [a[0], a[1], a[2]];
+  const u: Vec3 = [ax[0] / L, ax[1] / L, ax[2] / L];
+  const v: Vec3 = [a[0] - c1[0], a[1] - c1[1], a[2] - c1[2]];
+  const k = v[0] * u[0] + v[1] * u[1] + v[2] * u[2];
+  const perp: Vec3 = [v[0] - k * u[0], v[1] - k * u[1], v[2] - k * u[2]];
+  const w: Vec3 = [
+    u[1] * v[2] - u[2] * v[1],
+    u[2] * v[0] - u[0] * v[2],
+    u[0] * v[1] - u[1] * v[0],
+  ];
+  const th = (deg * Math.PI) / 180;
+  const cs = Math.cos(th);
+  const sn = Math.sin(th) * sign;
+  return [
+    c1[0] + k * u[0] + cs * perp[0] + sn * w[0],
+    c1[1] + k * u[1] + cs * perp[1] + sn * w[1],
+    c1[2] + k * u[2] + cs * perp[2] + sn * w[2],
+  ];
+}
+
+/**
+ * 折起方向取哪一边：朝 +z 抬的那一边。
+ *
+ * 立体图的约定是"底面躺在 z=0、往上长"，所以折起 = z 变大。
+ * 只在这里探一次数值，符号随后写死在表达式里——不能每帧再判断，
+ * 否则拖滑杆的瞬间可能整体翻面。探不出数值（参数化）就用正方向。
+ */
+function foldSign(p: Tri, c1: Tri, c2: Tri, deg: number): number {
+  const ev = (t: Tri): Vec3 | null =>
+    evalVec3Detailed([t[0], t[1], t[2]] as Vec3Like, {}).value;
+  const P = ev(p);
+  const C1 = ev(c1);
+  const C2 = ev(c2);
+  if (!P || !C1 || !C2) return 1;
+  const plus = rotAboutNumeric(P, C1, C2, deg, 1);
+  const minus = rotAboutNumeric(P, C1, C2, deg, -1);
+  return plus[2] >= minus[2] ? 1 : -1;
+}
+
+/**
  * 按 derive 声明生成坐标表达式。
  * 每个分支都是教科书公式；括号显式加满，避免优先级歧义。
  */
@@ -135,6 +182,28 @@ function computeDerive3(
       const ap = subE(P0, A);
       const k = `(${p(dotE(ap, ab))} / ${p(dotE(ab, ab))})`;
       return addE(A, scaleE(k, ab));
+    }
+    case 'fold': {
+      // 绕折痕转 deg 度：P' = C₁ + (v·u)u + cosθ·(v − (v·u)u) + sinθ·(u × v)
+      //   v = P − C₁，u = 折痕方向的单位向量
+      // 和别的分支一样，算出来仍是**表达式**：折起题里顶点坐标可以带参数，
+      // 一旦落成数字，滑杆就拖不动了。
+      const P = coordOf(d.of);
+      const C1 = coordOf(d.crease[0]);
+      const C2 = coordOf(d.crease[1]);
+      if (!P || !C1 || !C2) return null;
+      const ax = subE(C2, C1);
+      const L = `sqrt(${p(dotE(ax, ax))})`;
+      const u: Tri = [`(${p(ax[0])}) / ${p(L)}`, `(${p(ax[1])}) / ${p(L)}`, `(${p(ax[2])}) / ${p(L)}`];
+      const v = subE(P, C1);
+      const kv = scaleE(dotE(v, u), u); // (v·u)u
+      const perp = subE(v, kv); // 垂直于折痕的那一份
+      const w = crossE(u, v);
+      const th = (d.deg * Math.PI) / 180;
+      const round = (x: number) => (Math.abs(x) < 1e-12 ? 0 : x);
+      const cs = round(Math.cos(th));
+      const sn = round(Math.sin(th)) * foldSign(P, C1, C2, d.deg);
+      return addE(addE(addE(C1, kv), scaleE(String(cs), perp)), scaleE(String(sn), w));
     }
     case 'circumcenter':
     case 'incenter': {

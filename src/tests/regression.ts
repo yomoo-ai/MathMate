@@ -18,10 +18,16 @@
 import { SceneRenderer } from '../core/renderer';
 import { parseScene } from '../protocol/parser';
 import { parseScene3D } from '../protocol/parser3d';
+import { parseJsonLoose } from '../protocol/jsonRepair';
 import { measureReadouts, verifyScene, type Issue } from '../protocol/verifier';
 import { intersectCandidates, measureReadouts3D, verifyScene3D } from '../protocol/verifier3d';
 import { buildAnnotations3D, pickAnnotations3D } from '../core/annotations3d';
 import { autoFix3D } from '../protocol/autofix3d';
+import { foldAngleFrom, foldPositions, planFold } from '../protocol/fold3d';
+import { compileTimeline, sampleBeat } from '../ui/timeline';
+import type { Narration } from '../llm/narration';
+import { resolveScene3D } from '../protocol/resolve3d';
+import { evalVec3 } from '../protocol/expr';
 import type { Point3Object, Scene3D, Scene3DObject, Vec3 } from '../protocol/scene3d';
 import { CASES, CASES_3D, RENDER_CASES, type TestCase, type TestCase3D } from './cases';
 import { FEW_SHOT_EXAMPLE, CYLINDER_EXAMPLE } from '../llm/prompt3d';
@@ -200,6 +206,10 @@ export function runAll(): Report {
     ...runPromptCases(),
     ...runAnnotationCases3D(),
     ...runAutoFixCases3D(),
+    ...runGuardCases3D(),
+    ...runFoldCases3D(),
+    ...runFoldDeriveCases3D(),
+    ...runJsonRepairCases(),
     ...runRenderCases(),
   ];
   const skipped = rows.filter((r) => r.skipped).length;
@@ -282,6 +292,582 @@ function checkPromptExample(
  * 只做视野相关断言（不比对像素）：像素比对太脆，改一下配色就全红；
  * 而"视野对不对"恰好是历史上唯一一次严重画面事故的根因。
  * =============================================================== */
+/* ===============================================================
+ * 折起（翻折）关
+ *
+ * 这一段守的是"折起来"这件事的数学：展开态是不是真的展开、折起角是不是真的那么多、
+ * 声明坏掉时会不会安静地不演（而不是把图扭成一团）。
+ * 折起是唯一会让"顶点坐标随时间变"的功能，出错的表现往往不是报错，
+ * 而是"图看起来在动，但动的不是那一块"——所以必须在数值层卡死。
+ * =============================================================== */
+function runFoldCases3D(): RowResult[] {
+  const mk = (name: string, why: string, ok: boolean, actual?: string): RowResult => ({
+    name,
+    why,
+    gate: '折起关',
+    ok,
+    detail: ok ? '全部通过' : '断言不成立',
+    actualText: actual,
+  });
+
+  // 矩形 ABCD 沿 BD 折起：B、D 在折痕上；A 折到 (1,0,1)，C 留在原平面。
+  // 摊平时 A 应该回到 (1,-1,0)——正好是绕 x 轴转 +90° 的像。
+  const scene: Scene3D = {
+    space: '3d' as const,
+    meta: { title: '翻折测试' },
+    params: [],
+    objects: [
+      { id: 'B', type: 'point3' as const, at: [0, 0, 0] },
+      { id: 'D', type: 'point3' as const, at: [2, 0, 0] },
+      { id: 'A', type: 'point3' as const, at: [1, 0, 1] },
+      { id: 'C', type: 'point3' as const, at: [1, 2, 0] },
+    ],
+    fold: { crease: ['B', 'D'], moving: ['A', 'B', 'D'], deg: 90 },
+  };
+  const pts = new Map<string, Vec3>([
+    ['B', [0, 0, 0]],
+    ['D', [2, 0, 0]],
+    ['A', [1, 0, 1]],
+    ['C', [1, 2, 0]],
+  ]);
+
+  const rows: RowResult[] = [];
+  const { plan, why } = planFold(scene.fold, pts);
+
+  rows.push(
+    mk(
+      '折起：折痕在 moving 平面上时核成计划',
+      '矩形沿对角线折起是最标准的翻折题。核不出来，视频就演不了折起过程',
+      !!plan && plan.ids.length === 3,
+      plan ? `deg=${plan.deg} ids=${plan.ids.join(',')}` : `失败：${why}`,
+    ),
+  );
+
+  // ① 展开态：应该把 A 摊到折痕的另一侧 (1,-1,0)，而不是压到 C 身上
+  {
+    let ok = false;
+    let detail = '';
+    if (plan) {
+      const flat = foldPositions(plan, plan.flatOffset).get('A');
+      ok = !!flat && Math.hypot(flat[0] - 1, flat[1] + 1, flat[2]) < 1e-6 && plan.flatOffset === 90;
+      detail = flat
+        ? `flatOffset=${plan.flatOffset} 展开后 A=(${flat.map((v) => v.toFixed(3)).join(', ')})`
+        : '没有 A';
+    } else detail = '计划没建出来';
+    rows.push(
+      mk(
+        '折起：展开到"另一半的反方向"（不能叠在另一块上）',
+        '绕折痕往两边都能摊平，但只有一边是原来的平铺图。摊错边会看到两块纸叠在一起',
+        ok,
+        detail,
+      ),
+    );
+  }
+
+  // ② 实测折起角：A 的垂直分量与 C 的垂直分量夹角是 90°
+  {
+    let ok = false;
+    let detail = '';
+    if (plan) {
+      const got = foldAngleFrom(plan, [1, 0, 1], [1, 2, 0]);
+      ok = got !== null && Math.abs(got - 90) < 0.01;
+      detail = got === null ? '量不出来' : `实测 ${got.toFixed(2)}°`;
+    } else detail = '计划没建出来';
+    rows.push(
+      mk(
+        '折起：实测折起角与声明一致（90°）',
+        '声明 90° 实际折 60°，展开再折回去就会多折 30°，看起来像那块平面自己往上翘',
+        ok,
+        detail,
+      ),
+    );
+  }
+
+  // ③ moving 里混进另一块的点：必须拒绝（否则整张图一起转）
+  {
+    const bad = planFold({ crease: ['B', 'D'], moving: ['A', 'B', 'D', 'C'], deg: 90 }, pts);
+    rows.push(
+      mk(
+        '折起：moving 混进另一块的点时拒绝执行',
+        '这是最危险的一种错：平面照样有法向、折痕照样在平面上，一放行就把整张图转走',
+        !bad.plan && !!bad.why && bad.why.includes('C'),
+        bad.plan ? '居然通过了' : bad.why,
+      ),
+    );
+  }
+
+  // ④ 折痕端点不存在
+  {
+    const bad = planFold({ crease: ['B', 'M'], moving: ['A', 'B', 'D'], deg: 90 }, pts);
+    rows.push(
+      mk(
+        '折起：折痕端点不存在时拒绝（并说清是哪个点）',
+        '模型会编 id。编出来的折痕如果照样"折"，转轴就成了两个坐标算不出来的点',
+        !bad.plan && !!bad.why && bad.why.includes('M'),
+        bad.plan ? '居然通过了' : bad.why,
+      ),
+    );
+  }
+
+  // ⑤ 体检：声明 90° 但图只折了 60° → warn 里要有实测值
+  {
+    // 折起 60°：A 的垂直分量方向 (cos30°, sin30°) 相对摊平方向 (0,-1) 转了 60°
+    const a60: Vec3 = [1, -0.5, Math.sqrt(3) / 2];
+    const s60 = resolveScene3D({
+      ...scene,
+      objects: scene.objects.map((o) =>
+        o.id === 'A' ? ({ ...o, at: a60 } as Scene3DObject) : o,
+      ),
+    });
+    const issues = verifyScene3D(s60);
+    const hit = issues.find((i) => i.where === 'fold' && i.message.includes('实测折起角'));
+    rows.push(
+      mk(
+        '折起：体检报出"声明与实测不一致"',
+        '这一条是给模型看的：它会照着数字把坐标折到位，或者把 deg 改成实测值',
+        !!hit,
+        hit ? hit.message : `没有这条：${JSON.stringify(issues.map((i) => i.message))}`,
+      ),
+    );
+  }
+
+  // ⑥ 折起 + 截面：要提示"动画已停用"，而不是默默画歪
+  {
+    const withSection = resolveScene3D({
+      ...scene,
+      objects: [
+        ...scene.objects,
+        { id: 'sec', type: 'section3' as const, cut: ['A', 'B', 'C'], plane: ['A', 'B', 'D'] },
+      ] as Scene3DObject[],
+    });
+    const issues = verifyScene3D(withSection);
+    const hit = issues.find((i) => i.where === 'fold' && i.message.includes('停用'));
+    rows.push(
+      mk(
+        '折起：与截面同时出现时提示动画停用',
+        '截面每帧都要按顶点重算，点一动就画歪。停用必须说出来，否则用户以为坏了',
+        !!hit,
+        hit ? hit.message : `没有这条：${JSON.stringify(issues.map((i) => i.message))}`,
+      ),
+    );
+  }
+
+  // ⑦ 时间轴：折起进度按句累积，第一句摊平、折起那句折完
+  {
+    const n: Narration = {
+      knowns: [],
+      fromModel: true,
+      steps: [
+        {
+          title: '折起',
+          beats: [
+            { say: '先把矩形摊平看。', actions: [] },
+            { say: '沿 BD 折起来。', actions: [{ kind: 'fold' }] },
+            { say: '折好以后看这个二面角。', actions: [] },
+          ],
+        },
+      ],
+    };
+    const tl = compileTimeline(n, null, {}, { lineWidth: 0.1, helperWidth: 0.2, foldFrom: 90 });
+    const b0 = tl.beats[0];
+    const b1 = tl.beats[1];
+    const b2 = tl.beats[2];
+    const startFlat = sampleBeat(tl, 0, 0).fold === 90;
+    const endFolded = sampleBeat(tl, 1, b1.duration).fold === 0;
+    const stays = b2.foldStart === 0 && b2.foldEnd === 0;
+    rows.push(
+      mk(
+        '折起：时间轴按句累积（摊平 → 折起 → 保持折好）',
+        '折起是个状态而不是一次性的动作：折完之后后面每一句都得是折好的样子',
+        startFlat && endFolded && stays && b0.foldEnd === 90,
+        `b0=${b0.foldStart}→${b0.foldEnd} b1=${b1.foldStart}→${b1.foldEnd} b2=${b2.foldStart}→${b2.foldEnd}`,
+      ),
+    );
+  }
+
+  // ⑧ 讲稿一次都没提折起：图必须一直是折好的（不能莫名其妙先摊平）
+  {
+    const n: Narration = {
+      knowns: [],
+      fromModel: true,
+      steps: [{ title: '直接算', beats: [{ say: '直接看折好以后的图。', actions: [] }] }],
+    };
+    const tl = compileTimeline(n, null, {}, { lineWidth: 0.1, helperWidth: 0.2, foldFrom: 90 });
+    rows.push(
+      mk(
+        '折起：讲稿没提折起时保持折好状态',
+        '场景声明的是折好之后的图。没有 fold 动作却先摊平，等于凭空改图',
+        tl.beats.every((b) => b.foldStart === 0 && b.foldEnd === 0),
+        `首句 fold=${tl.beats[0].foldStart}`,
+      ),
+    );
+  }
+
+  // ⑨ 解析关：fold.deg 越界要报格式错
+  {
+    const bad = parseScene3D(
+      JSON.stringify({
+        space: '3d',
+        meta: { title: 'x' },
+        params: [],
+        objects: [
+          { id: 'A', type: 'point3', at: [0, 0, 0] },
+          { id: 'B', type: 'point3', at: [1, 0, 0] },
+          { id: 'C', type: 'point3', at: [1, 1, 0] },
+        ],
+        fold: { crease: ['A', 'B'], moving: ['A', 'B', 'C'], deg: 0 },
+      }),
+    );
+    rows.push(
+      mk(
+        '折起：deg 写成 0 时在格式关就被拦下',
+        '0° 等于没折，演出来是"图不动"，用户会以为坏了；宁可让它在格式关报错',
+        !bad.ok && bad.errors.some((e) => e.includes('fold.deg')),
+        bad.ok ? '居然通过了' : bad.errors.join(' / '),
+      ),
+    );
+  }
+
+  return rows;
+}
+
+/**
+ * 折后点交给程序算（derive.kind = 'fold'）——2026-11-09 那道等腰梯形折叠题的复盘。
+ *
+ * 当时的现场：
+ *   模型手写 A₁ = (-1, 0, 1.73)，而正解是 O + (0,0,√3) = (0.5, 0.866, 1.732)。
+ *   它写的两条断言「A₁O ⊥ BE」「OC ⊥ BE」**都是对的**，但坐标错了，
+ *   体检实测 75.52° 打回；改了两轮也改不对，最后整题生不出来。
+ * 这一组用例就是钉住：坐标必须由程序转，且转出来的东西要能过体检。
+ */
+function runFoldDeriveCases3D(): RowResult[] {
+  const mk = (name: string, why: string, ok: boolean, actual?: string): RowResult => ({
+    name,
+    why,
+    gate: '折后点关',
+    ok,
+    detail: ok ? '全部通过' : '断言不成立',
+    actualText: actual,
+  });
+  const rows: RowResult[] = [];
+  const H = Math.sqrt(3);
+
+  // 等腰梯形：BC=2、AD=4、∠A=60°、E 为 AD 中点。ABE 正好是边长 2 的正三角形。
+  const trapezoid = {
+    space: '3d',
+    meta: { title: '等腰梯形折叠' },
+    params: [],
+    objects: [
+      { id: 'A', type: 'point3', at: [-1, H, 0], hidden: true },
+      { id: 'B', type: 'point3', at: [0, 0, 0] },
+      { id: 'C', type: 'point3', at: [2, 0, 0] },
+      { id: 'D', type: 'point3', at: [3, H, 0] },
+      { id: 'E', type: 'point3', at: [1, H, 0] },
+      { id: 'O', type: 'point3', derive: { kind: 'midpoint', a: 'B', b: 'E' } },
+      { id: 'F', type: 'point3', derive: { kind: 'midpoint', a: 'D', b: 'E' } },
+      {
+        id: 'A1',
+        type: 'point3',
+        label: 'A₁',
+        derive: { kind: 'fold', of: 'A', crease: ['B', 'E'], deg: 90 },
+      },
+      { id: 'BC', type: 'edge3', a: 'B', b: 'C' },
+      { id: 'CD', type: 'edge3', a: 'C', b: 'D' },
+      { id: 'DE', type: 'edge3', a: 'D', b: 'E' },
+      { id: 'EB', type: 'edge3', a: 'E', b: 'B' },
+      { id: 'A1B', type: 'edge3', a: 'A1', b: 'B' },
+      { id: 'A1E', type: 'edge3', a: 'A1', b: 'E' },
+      { id: 'fBase', type: 'face3', points: ['B', 'C', 'D', 'E'], opacity: 0.12 },
+      { id: 'fFlap', type: 'face3', points: ['A1', 'B', 'E'], opacity: 0.2 },
+    ],
+    constraints: [
+      { type: 'perp-lines', a: ['A1', 'O'], b: ['B', 'E'] },
+      { type: 'perp-lines', a: ['O', 'C'], b: ['B', 'E'] },
+    ],
+    steps: [
+      {
+        title: '折起',
+        text: '将△ABE沿BE折起到△A₁BE的位置，点O、F分别为BE、DE的中点',
+      },
+      {
+        title: '判断',
+        text: '是否存在点P在A₁C上，使得BP∥平面A₁OF',
+      },
+    ],
+    fold: { crease: ['B', 'E'], moving: ['A1', 'B', 'E'], deg: 90 },
+  };
+
+  const parsed = parseScene3D(JSON.stringify(trapezoid));
+  // resolve 后的 at 仍是**表达式字符串**（为了参数化）。要数值就得求值。
+  const atOf = (scene: Scene3D, id: string): number[] | null => {
+    const o = scene.objects.find((x) => x.id === id) as Point3Object | undefined;
+    if (!o || o.at === undefined) return null;
+    const v = evalVec3(o.at, {});
+    return v ? [v[0], v[1], v[2]] : null;
+  };
+
+  // ① 折后点：A₁ 必须正对 O 上方 √3 处（这是"折成直角"的几何后果）
+  {
+    const s = parsed.ok ? parsed.scene : null;
+    const a1 = s ? atOf(s, 'A1') : null;
+    const want = [0.5, H / 2, H];
+    const d = a1 ? Math.hypot(a1[0] - want[0], a1[1] - want[1], a1[2] - want[2]) : NaN;
+    rows.push(
+      mk(
+        '折后点：A₁ 由程序绕 BE 转 90°，落在 O 正上方 √3',
+        '模型手算这一步必错（这次写成 (-1,0,1.73)）。它错了图就全错，而且断言还是对的，看不出来',
+        !!a1 && d < 1e-6,
+        a1
+          ? `A₁=(${a1.map((v) => v.toFixed(3)).join(', ')})，与正解差 ${d.toExponential(2)}`
+          : `算不出：${parsed.ok ? JSON.stringify((parsed.scene.objects.find((x) => x.id === 'A1') as Point3Object | undefined)?.at) : parsed.errors.join(' / ')}`,
+      ),
+    );
+  }
+
+  // ② 折好后，题面的两条垂直关系必须真的成立（不给模型留"自己编坐标"的余地）
+  {
+    const issues = parsed.ok ? verifyScene3D(parsed.scene) : [];
+    const errs = issues.filter((i) => i.level === 'error');
+    rows.push(
+      mk(
+        '折后点：折出来的图能过整套体检（含 A₁O⊥BE、OC⊥BE 两条断言）',
+        '坐标算对了，垂直关系自然成立；这一条如果红，说明旋转公式或方向选错了',
+        parsed.ok && errs.length === 0,
+        parsed.ok ? (errs.length ? errs.map((e) => e.message).join(' | ') : '0 条 error') : '解析失败',
+      ),
+    );
+  }
+
+  // ③ 正文提到 A（折前的位置）和 P（假设点）都不该被判"图里没有"
+  {
+    const issues = parsed.ok ? verifyScene3D(parsed.scene) : [];
+    const bad = issues.filter((i) => i.where.startsWith('steps[') && i.level === 'error');
+    rows.push(
+      mk(
+        '点名检查：折前的 A、假设的 P 都放过',
+        '这两条把模型逼去"补点"，反而绕开了真正的坐标错误。上一轮就是连卡两次',
+        parsed.ok && bad.length === 0,
+        bad.length ? bad.map((i) => i.message).join(' | ') : '没有误报',
+      ),
+    );
+  }
+
+  // ④ hidden 的折前点不进画面，也不该被当成"孤立点"
+  {
+    const o = parsed.ok
+      ? (parsed.scene.objects.find((x) => x.id === 'A') as Point3Object | undefined)
+      : undefined;
+    const issues = parsed.ok ? verifyScene3D(parsed.scene) : [];
+    const iso = issues.find((i) => i.where === 'A');
+    rows.push(
+      mk(
+        'hidden：折前的 A 保留坐标但不画，也不报孤立点',
+        '它只提供坐标，画面上不该有第二个 A；报孤立点会逼模型删掉它，折后点就算不出来了',
+        !!o && o.hidden === true && !iso,
+        iso ? iso.message : `hidden=${o ? o.hidden : '无此点'}`,
+      ),
+    );
+  }
+
+  // ⑤ 坐标按 90° 折、动画写 60° → 必须报错（否则演到一半会跳）
+  {
+    const bad = parseScene3D(
+      JSON.stringify({ ...trapezoid, fold: { crease: ['B', 'E'], moving: ['A1', 'B', 'E'], deg: 60 } }),
+    );
+    const issues = bad.ok ? verifyScene3D(bad.scene) : [];
+    const hit = issues.find((i) => i.level === 'error' && i.message.includes('fold.deg'));
+    rows.push(
+      mk(
+        '折后点：坐标 90° 与动画 deg 60° 不一致时报错',
+        '两边角度不同，展开再折回时回到的位置和算好的坐标差一截，画面上会跳一下',
+        !!hit,
+        hit ? hit.message : `没有这条：${JSON.stringify(issues.map((i) => i.message))}`,
+      ),
+    );
+  }
+
+  // ⑥ 要折的点就在折痕上 → 转多少度都不动，必须报错
+  {
+    // 单独造一个不退化的场景：三点共线会被"整图压扁"的根因检查吞掉，
+    // 那就验不到这条 fold 错误了（真实的共线场景本来就该由那条报）
+    const bad = parseScene3D(
+      JSON.stringify({
+        space: '3d',
+        meta: { title: '折痕上的点' },
+        params: [],
+        objects: [
+          { id: 'B', type: 'point3', at: [0, 0, 0] },
+          { id: 'C', type: 'point3', at: [1, 0, 0] },
+          { id: 'A', type: 'point3', at: [0.5, 0, 0] },
+          // 两个反向的点撑开"体"，否则四点共面（B、C、A 还共线）会被压扁根因吞掉
+          { id: 'Z', type: 'point3', at: [0.5, 1, 0.8] },
+          { id: 'W', type: 'point3', at: [0.5, 1, -0.8] },
+          {
+            id: 'A1',
+            type: 'point3',
+            derive: { kind: 'fold', of: 'A', crease: ['B', 'C'], deg: 90 },
+          },
+          { id: 'BC', type: 'edge3', a: 'B', b: 'C' },
+          { id: 'ZB', type: 'edge3', a: 'Z', b: 'B' },
+          { id: 'ZC', type: 'edge3', a: 'Z', b: 'C' },
+          { id: 'WB', type: 'edge3', a: 'W', b: 'B' },
+          { id: 'WC', type: 'edge3', a: 'W', b: 'C' },
+          { id: 'fZBC', type: 'face3', points: ['Z', 'B', 'C'], opacity: 0.2 },
+          { id: 'fWBC', type: 'face3', points: ['W', 'B', 'C'], opacity: 0.2 },
+        ],
+      }),
+    );
+    const issues = bad.ok ? verifyScene3D(bad.scene) : [];
+    const hit = issues.find((i) => i.level === 'error' && i.message.includes('落在折痕'));
+    rows.push(
+      mk(
+        '折后点：of 落在折痕上时报错',
+        '这种场景折出来图不动，模型还以为是"折了 0°"，白折腾一轮',
+        !!hit,
+        hit ? hit.message : `没有这条：${JSON.stringify(issues.map((i) => i.message))}`,
+      ),
+    );
+  }
+
+  // ⑦ 折回展开态时，A₁ 必须正好落到 A 的位置（derive 与动画是同一条几何）
+  {
+    let detail = '算不出';
+    let ok = false;
+    if (parsed.ok) {
+      const pts = new Map<string, Vec3>();
+      for (const o of parsed.scene.objects) {
+        if (o.type !== 'point3') continue;
+        const p = (o as Point3Object).at;
+        if (p === undefined) continue;
+        const v = evalVec3(p, {});
+        if (v) pts.set(o.id, [v[0], v[1], v[2]]);
+      }
+      const { plan } = planFold(parsed.scene.fold, pts);
+      const flat = plan ? foldPositions(plan, -plan.deg).get('A1') : undefined;
+      const a = atOf(parsed.scene, 'A');
+      if (flat && a) {
+        const d = Math.hypot(flat[0] - a[0], flat[1] - a[1], flat[2] - a[2]);
+        ok = d < 1e-6;
+        detail = `展开后 A₁=(${flat.map((v) => v.toFixed(3)).join(', ')})，A=(${a.map((v) => v.toFixed(3)).join(', ')})，差 ${d.toExponential(2)}`;
+      } else detail = plan ? '展开后没有 A₁' : '折起计划没建出来';
+    }
+    rows.push(
+      mk(
+        '折后点：折回展开态时 A₁ 正好落回 A',
+        'derive 算的是折后位置、动画是"把折后那块转回去"。两者必须是同一条几何，否则开头那一帧会跟后面接不上',
+        ok,
+        detail,
+      ),
+    );
+  }
+
+  // ⑧ 复现 11-09 那一份：手写折后坐标、没有 fold、没有 derive
+  {
+    const hand = parseScene3D(
+      JSON.stringify({
+        ...trapezoid,
+        objects: trapezoid.objects
+          .filter((o) => o.id !== 'A1' && o.id !== 'A')
+          // 模型当时写的就是这个位置：x,y 完全跑偏（正解是 0.5, 0.866, 1.732）
+          .concat([{ id: 'A1', type: 'point3', label: 'A₁', at: [-1, 0, 1.73] }] as never),
+        fold: undefined,
+      }),
+    );
+    const issues = hand.ok ? verifyScene3D(hand.scene) : [];
+    const hint = issues.find((i) => i.where === 'fold' && i.message.includes('derive'));
+    const perp = issues.find((i) => i.level === 'error' && i.message.includes('夹角实测'));
+    rows.push(
+      mk(
+        '折后点：手写折后坐标时给出"改用 derive fold"的提示',
+        '模型不会自己想到这一步。只报"垂直不成立"，它只会去挪坐标，挪两轮也挪不对',
+        !!hint,
+        hint ? hint.message.slice(0, 60) + '…' : `没有提示：${JSON.stringify(issues.map((i) => i.message))}`,
+      ),
+    );
+    rows.push(
+      mk(
+        '折后点：手写坐标错了要真的被抓住（这份坐标实测 75.5°）',
+        '这一条是"护栏本身没退化"的证明：错的图必须报错，不能因为加了提示就放过',
+        !!perp,
+        perp ? perp.message.slice(0, 80) : '居然没报错',
+      ),
+    );
+  }
+
+  return rows;
+}
+/**
+ * JSON 语法容错：这四类都实测出现过，其中"缺逗号"就是 2026-11-09 那次
+ * 在 position 599 报错的东西。修不好要原样报错，不能悄悄给出半份图。
+ */
+function runJsonRepairCases(): RowResult[] {
+  const mk = (name: string, why: string, ok: boolean, actual?: string): RowResult => ({
+    name,
+    why,
+    gate: 'JSON 关',
+    ok,
+    detail: ok ? '全部通过' : '断言不成立',
+    actualText: actual,
+  });
+  const rows: RowResult[] = [];
+  const base = { space: '3d', meta: { title: 'x' }, params: [], objects: [{ id: 'A', type: 'point3', at: [0, 0, 0] }, { id: 'B', type: 'point3', at: [1, 0, 0] }, { id: 'C', type: 'point3', at: [0, 1, 1] }] };
+
+  const tryParse = (
+    text: string,
+  ): { ok: true; v: Record<string, unknown> } | { ok: false; why: string } => {
+    try {
+      return { ok: true, v: parseJsonLoose(text) as Record<string, unknown> };
+    } catch (e) {
+      return { ok: false, why: (e as Error).message };
+    }
+  };
+
+  const valid = JSON.stringify(base);
+  const variants: Array<{ name: string; text: string; why: string }> = [
+    {
+      name: 'JSON 关：尾逗号',
+      text: valid.replace('"params":[],', '"params":[], ').replace('}]}}', '},]}}'),
+      why: '模型写 JS 的习惯：{"a":1,}。语法错但意思完全清楚',
+    },
+    {
+      name: 'JSON 关：漏逗号（两个属性连在一起）',
+      text: valid.replace('"params":[],"objects"', '"params":[] "objects"'),
+      why: '这就是 position 599 那类错：值后面直接跟下一个键',
+    },
+    {
+      name: 'JSON 关：带 // 注释',
+      text: valid.replace('"params":[],', '"params":[], // 本题无参数'),
+      why: '模型爱在 JSON 里解释一句，人看着没问题，机器直接失败',
+    },
+    {
+      name: 'JSON 关：输出被截断',
+      text: valid.slice(0, Math.floor(valid.length * 0.8)),
+      why: '撞上输出长度上限。能救回来一部分总比整题重生成强',
+    },
+  ];
+  for (const v of variants) {
+    const r = tryParse(v.text);
+    rows.push(mk(v.name, v.why, r.ok, r.ok ? '修好了' : `仍然失败：${r.why}`));
+  }
+
+  // 字符串里带逗号/花括号的正经 JSON 不能被"修"坏
+  {
+    const tricky = JSON.stringify({ ...base, meta: { title: '注意,} 这种字符' } });
+    const r = tryParse(tricky);
+    const title = r.ok ? (r.v.meta as { title?: string }).title : undefined;
+    rows.push(
+      mk(
+        'JSON 关：字符串里的逗号花括号不被误伤',
+        '修复器只能动语法层。把正文里的字符改掉比报错更糟——错得没人发现',
+        r.ok && title === '注意,} 这种字符',
+        r.ok ? `title=${title}` : `失败：${r.why}`,
+      ),
+    );
+  }
+
+  return rows;
+}
+
 function runRenderCases(): RowResult[] {
   const host = document.getElementById('render-sink');
   if (!host) return [];
@@ -824,6 +1410,163 @@ function runAutoFixCases3D(): RowResult[] {
       'AB 的延长线相交点全是已有顶点或共端点，不该瞎列',
       candAB.length === 0,
       JSON.stringify(candAB),
+    ),
+  );
+
+  return rows;
+}
+
+/* ===============================================================
+ * 护栏关：① 图形被压扁时只报根因 ② 面∩面=交线 的断言核对
+ * =============================================================== */
+function runGuardCases3D(): RowResult[] {
+  const mk = (name: string, why: string, ok: boolean, actual?: string): RowResult => ({
+    name,
+    why,
+    gate: '护栏关',
+    ok,
+    detail: ok ? '全部通过' : '断言不成立',
+    actualText: actual,
+  });
+
+  const rows: RowResult[] = [];
+
+  /** 正方体；flat=true 时上层顶点 z 也是 0（"忘了给高度"的事故现场） */
+  const cubeScene = (
+    flat: boolean,
+    steps: Array<{ title: string; text: string }> = [],
+  ): Scene3D => {
+    const h = flat ? 0 : 2;
+    return {
+      space: '3d' as const,
+      meta: { title: flat ? '压扁的立方体' : '正方体' },
+      params: [],
+      objects: [
+        { id: 'A', type: 'point3' as const, at: [0, 0, 0] },
+        { id: 'B', type: 'point3' as const, at: [2, 0, 0] },
+        { id: 'C', type: 'point3' as const, at: [2, 2, 0] },
+        { id: 'D', type: 'point3' as const, at: [0, 2, 0] },
+        { id: 'A1', type: 'point3' as const, at: [0, 0, h] },
+        { id: 'B1', type: 'point3' as const, at: [2, 0, h] },
+        { id: 'C1', type: 'point3' as const, at: [2, 2, h] },
+        { id: 'D1', type: 'point3' as const, at: [0, 2, h] },
+        { id: 'fBottom', type: 'face3' as const, points: ['A', 'B', 'C', 'D'] },
+        { id: 'fTop', type: 'face3' as const, points: ['A1', 'B1', 'C1', 'D1'] },
+        { id: 'fFront', type: 'face3' as const, points: ['A', 'B', 'B1', 'A1'] },
+        { id: 'eAB', type: 'edge3' as const, a: 'A', b: 'B' },
+        { id: 'eBC', type: 'edge3' as const, b: 'C', a: 'B' },
+        { id: 'eAA1', type: 'edge3' as const, a: 'A', b: 'A1' },
+      ],
+      constraints: flat
+        ? [{ type: 'perp-lines' as const, a: ['A', 'B'] as [string, string], b: ['A', 'A1'] as [string, string] }]
+        : [],
+      steps,
+    };
+  };
+
+  const runVerify = (scene: Scene3D): Issue[] => {
+    const parsed = parseScene3D(JSON.stringify(scene));
+    if (!parsed.ok) {
+      return [{ level: 'error', where: 'parse', message: parsed.errors.join('；') }];
+    }
+    return verifyScene3D(parsed.scene);
+  };
+
+  // ① 压扁的立方体：8 个顶点 z 全 0 → 只回传「所有顶点共面」一条
+  const flatErrs = runVerify(cubeScene(true)).filter((i) => i.level === 'error');
+  rows.push(
+    mk(
+      '护栏：图形被压扁时只报根因一条',
+      '8 个顶点 z 全 0，顶点重合 / AB⊥AA₁ 都是连带现象，一次全报会让模型去改症状',
+      flatErrs.length === 1 &&
+        /同一个平面/.test(flatErrs[0].message) &&
+        /另有 \d+ 条/.test(flatErrs[0].message),
+      flatErrs.map((e) => e.message).join(' | '),
+    ),
+  );
+
+  // ② 文案 bug：全零偏差时不能出现「最偏离的  只差」（名字是空的）
+  rows.push(
+    mk(
+      '护栏：共面报错不出现空名字',
+      '所有点严格共面时取不到"最偏离的点"，文案要说"零偏差"而不是留空',
+      flatErrs.length === 1 && !/最偏离的\s*只差/.test(flatErrs[0].message),
+      flatErrs[0]?.message ?? '（没有报错）',
+    ),
+  );
+
+  // ③ 全部点共线：也应该立刻点出根因，而不是留一堆下游错误
+  const collinear: Scene3D = {
+    space: '3d' as const,
+    meta: { title: '所有点共线' },
+    params: [],
+    objects: [
+      { id: 'A', type: 'point3' as const, at: [0, 0, 0] },
+      { id: 'B', type: 'point3' as const, at: [1, 0, 0] },
+      { id: 'C', type: 'point3' as const, at: [2, 0, 0] },
+      { id: 'D', type: 'point3' as const, at: [3, 0, 0] },
+      { id: 'eAB', type: 'edge3' as const, a: 'A', b: 'B' },
+    ],
+  };
+  const colErrs = runVerify(collinear).filter((i) => i.level === 'error');
+  rows.push(
+    mk(
+      '护栏：所有顶点共线时报"不是立体图形"',
+      '连一个不共线的三点都找不出来时，必须直接说清根因',
+      colErrs.length === 1 && /同一条直线/.test(colErrs[0].message),
+      colErrs.map((e) => e.message).join(' | '),
+    ),
+  );
+
+  // ④ 正确断言：平面 A₁BD ∩ 平面 ABCD = BD（B、D 同时在这两个面上）
+  const okErrs = runVerify(
+    cubeScene(false, [{ title: '求交线', text: '平面 A1BD ∩ 平面 ABCD = BD。' }]),
+  ).filter((i) => i.level === 'error');
+  rows.push(
+    mk(
+      '护栏：正确的面∩面=交线 不误报',
+      'B、D 同时属于两个平面，断言成立就该放行',
+      okErrs.length === 0,
+      okErrs.map((e) => e.message).join(' | ') || '（没有报错，正确）',
+    ),
+  );
+
+  // ⑤ 错误断言：写成 AC（A、C 都不在平面 A₁BD 上）
+  const badErrs = runVerify(
+    cubeScene(false, [{ title: '求交线', text: '平面 A1BD ∩ 平面 ABCD = AC。' }]),
+  ).filter((i) => i.level === 'error');
+  rows.push(
+    mk(
+      '护栏：面∩面=交线 端点不在两面上时报错',
+      'AC 不在平面 A₁BD 上，这种断言会把学生教错',
+      badErrs.some((e) => /不在两个平面上/.test(e.message) && /AC|平面 A1BD/.test(e.message)),
+      badErrs.map((e) => e.message).join(' | '),
+    ),
+  );
+
+  // ⑥ 平行平面却声称交于一条线
+  const parErrs = runVerify(
+    cubeScene(false, [{ title: '求交线', text: '平面 A1B1C1D1 ∩ 平面 ABCD = AB。' }]),
+  ).filter((i) => i.level === 'error');
+  rows.push(
+    mk(
+      '护栏：平行平面声称有交线时报错',
+      '上下底面平行，交不出直线，AB 更不在交线上',
+      parErrs.some((e) => /平行/.test(e.message) && /没有交线/.test(e.message)),
+      parErrs.map((e) => e.message).join(' | '),
+    ),
+  );
+
+  // ⑦ 名字里有点没声明（XYZ）→ 拆不干净，静默跳过，绝不瞎猜
+  const junkErrs = runVerify(
+    cubeScene(false, [{ title: '求交线', text: '平面 XYZ ∩ 平面 ABC = MN。' }]),
+  ).filter((i) => i.level === 'error');
+  rows.push(
+    mk(
+      '护栏：拆不开的平面名字不误报',
+      'XYZ / MN 不是本题顶点，交线检查必须放弃而不是编一个结论',
+      !junkErrs.some((e) => /交线|平行/.test(e.message)),
+      junkErrs.map((e) => e.message).join(' | ') || '（没有交线类报错，正确）',
     ),
   );
 

@@ -24,6 +24,7 @@ import {
   actionLabel,
   applyNewPoint,
   firstVisibleLabel,
+  motionLabel,
   resolvePoints,
 } from '../core/action';
 import { actionShapes, centroidOf } from '../core/actionMarks';
@@ -72,6 +73,15 @@ export interface CompiledBeat {
   /** 本句开始之前，黑板上已经有多少行（用于增量更新 DOM） */
   boardBefore: number;
   /**
+   * 折起角偏移（度）：0 = 折好（场景原样），负数 = 展开中。
+   * 两句之间要能接上，所以编译时按句累积，而不是每句自己算。
+   * 没声明翻折的场景这两个数恒为 0（播放器据此完全不管折起）。
+   */
+  foldStart: number;
+  foldEnd: number;
+  /** 本句里那个 fold 动作（有的话）：采样时按它的窗口补间 */
+  foldAction: CompiledAction | null;
+  /**
    * 本句所有动作"演完"后的静态图形，预计算一次。
    *
    * 为什么预计算：讲第 8 句时要同时画出前 7 句留下的所有记号（这就是
@@ -105,7 +115,17 @@ export function compileTimeline(
   narration: Narration,
   scene: Scene | null,
   params: Record<string, number>,
-  opts: { lineWidth: number; helperWidth: number; boardMode?: boolean },
+  opts: {
+    lineWidth: number;
+    helperWidth: number;
+    boardMode?: boolean;
+    /**
+     * 折起的起点偏移（度，带符号）：由渲染器按"往哪一边摊"算出来。
+     * 给了就表示"这一场开始是**完全展开**的"，第一句出现之前图是摊平的，
+     * 等到 fold 动作那句话说下去才折起来。不给 = 本题没有翻折。
+     */
+    foldFrom?: number;
+  },
 ): Timeline {
   const pos = scene ? resolvePoints(scene, params) : new Map<string, [number, number]>();
   const ctx: MarkContext = {
@@ -119,12 +139,22 @@ export function compileTimeline(
   const beats: CompiledBeat[] = [];
   const boardLines: CompiledBoardLine[] = [];
   let beatIndex = 0;
+  // 讲稿里一次都没提折起，就不该动这张图：场景声明的是**折好之后**的样子，
+  // 没有 fold 动作时图应该一直是折好的，而不是莫名其妙先摊平再折一遍
+  const anyFold = opts.foldFrom
+    ? narration.steps.some((st) => st.beats.some((b) => b.actions.some((a) => a.kind === 'fold')))
+    : false;
+  /** 折起角偏移的累积状态：从"完全展开"一路走到 0 */
+  let foldState = anyFold && opts.foldFrom ? opts.foldFrom : 0;
 
   narration.steps.forEach((step, stepIdx) => {
     step.beats.forEach((b, inStep) => {
       const isLastOfStep = inStep === step.beats.length - 1;
       const compiled: CompiledAction[] = [];
       let cursor = 0;
+
+      const foldStart = foldState;
+      let foldAction: CompiledAction | null = null;
 
       for (let ai = 0; ai < b.actions.length; ai++) {
         const action = b.actions[ai];
@@ -134,14 +164,19 @@ export function compileTimeline(
           if (!p) continue;
         }
         const dur = ACTION_MS[action.kind] ?? 400;
-        compiled.push({
+        const ca: CompiledAction = {
           action,
           start: cursor,
           dur,
           key: `b${beatIndex}a${ai}`,
-        });
+        };
+        compiled.push(ca);
+        if (action.kind === 'fold' && !foldAction) foldAction = ca;
         cursor += dur + ACTION_STAGGER_MS;
       }
+      // 折起：本句折完就停在 0（折好），后面的句子沿用这个状态
+      const foldEnd = foldAction ? 0 : foldStart;
+      foldState = foldEnd;
       // 最后一个动作不留下一个错峰间隔
       const actionEnd = compiled.length
         ? compiled[compiled.length - 1].start + compiled[compiled.length - 1].dur
@@ -201,14 +236,17 @@ export function compileTimeline(
         actions: compiled,
         board,
         duration,
-        // 3D 没有几何动作可演，emphasize 的 id 是物体名（cyl / axis），
-        // 直接拼成"看 cyl"这种提示还不如不提示，交给步骤标题兜底
-        label: scene ? firstVisibleLabel(compiled.map((c) => c.action)) : '',
+        // 3D 没有平面几何动作可演（弧、刻度都算的是二维坐标），
+        // 提示条只认"折起 / 换视角"这两种真正会发生的事
+        label: scene ? firstVisibleLabel(compiled.map((c) => c.action)) : motionLabel(compiled.map((c) => c.action)),
         focus: [...new Set(focus)],
         known: b.known,
         reveal: b.reveal,
         hold: b.hold ?? (isLastOfStep ? 900 : DEFAULT_HOLD),
         boardBefore: boardLines.length - board.length,
+        foldStart,
+        foldEnd,
+        foldAction,
         finalShapes: [],
       });
       beatIndex += 1;
@@ -241,6 +279,30 @@ export interface BeatFrame {
   label: string;
   /** 这一帧参数滑杆应该推到哪（含参数的题靠它让图形真的动起来） */
   param?: { name: string; value: number };
+  /**
+   * 这一帧的折起角偏移（度）：0 = 折好，负数 = 还在展开。undefined = 本题不折。
+   * 和 param 一样是"纯函数输出"——同样的 t 永远给同样的角度，暂停续播不会错。
+   */
+  fold?: number;
+  /**
+   * 本句的转向排期（3D 专用）。
+   *
+   * 这里只给"什么时候该转到哪"，不在这里真的转——因为转向是**一次性的动作**，
+   * 而采样每帧都要跑一遍，在这里触发等于每秒转 60 次。
+   * 播放器拿 key 去重，到点转一次。
+   */
+  turns: TurnCue[];
+}
+
+export interface TurnCue {
+  /** 去重用的 key（句下标 + 动作下标） */
+  key: string;
+  /** 相对本句开头的触发时刻 */
+  at: number;
+  dur: number;
+  face?: string;
+  azimuth?: number;
+  elevation?: number;
 }
 
 /**
@@ -251,7 +313,7 @@ export interface BeatFrame {
  */
 export function sampleBeat(tl: Timeline, index: number, t: number): BeatFrame {
   const beat = tl.beats[index];
-  if (!beat) return { overlay: [], boardCount: 0, boardActive: false, label: '' };
+  if (!beat) return { overlay: [], boardCount: 0, boardActive: false, label: '', turns: [] };
 
   const overlay: OverlayShape[] = [];
   // ① 之前讲过的句子：记号全部留在图上（这是"像讲题"而不是"像翻页"的根本）
@@ -262,7 +324,19 @@ export function sampleBeat(tl: Timeline, index: number, t: number): BeatFrame {
   // ② 当前这句：按 t 演出
   let label = '';
   let param: BeatFrame['param'];
+  const turns: TurnCue[] = [];
   for (const ca of beat.actions) {
+    if (ca.action.kind === 'view') {
+      // 转向不排进"演到哪"的进度里：它没有中间状态，只有"转过去了"
+      turns.push({
+        key: ca.key,
+        at: ca.start,
+        dur: ca.dur,
+        face: ca.action.face,
+        azimuth: ca.action.azimuth,
+        elevation: ca.action.elevation,
+      });
+    }
     if (t < ca.start) continue;
     const p = ca.dur <= 0 ? 1 : Math.min(1, (t - ca.start) / ca.dur);
     overlay.push(...actionShapes(ca.action, tl.ctx, p, ca.key));
@@ -278,6 +352,20 @@ export function sampleBeat(tl: Timeline, index: number, t: number): BeatFrame {
     }
   }
 
+  // ③ 折起：和扫参同一个路子，按 fold 动作的窗口把角度补出来
+  let fold: number | undefined;
+  if (beat.foldAction) {
+    const fa = beat.foldAction;
+    if (t < fa.start) fold = beat.foldStart;
+    else {
+      const p = fa.dur <= 0 ? 1 : Math.min(1, (t - fa.start) / fa.dur);
+      const e = p * p * (3 - 2 * p);
+      fold = beat.foldStart + (beat.foldEnd - beat.foldStart) * e;
+    }
+  } else if (beat.foldStart !== 0 || beat.foldEnd !== 0) {
+    fold = beat.foldEnd;
+  }
+
   let boardCount = beat.boardBefore;
   let boardActive = false;
   for (const line of beat.board) {
@@ -287,7 +375,7 @@ export function sampleBeat(tl: Timeline, index: number, t: number): BeatFrame {
     }
   }
 
-  return { overlay, boardCount, boardActive, label: label || beat.label, param };
+  return { overlay, boardCount, boardActive, label: label || beat.label, param, fold, turns };
 }
 
 /** 某一句在 t=0 的静态画面（跳句、暂停时用：直接给"这句刚开始"的样子） */

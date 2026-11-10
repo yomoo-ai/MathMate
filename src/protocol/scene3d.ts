@@ -41,6 +41,14 @@ export interface Point3Object extends Base3D {
   /** 手写坐标；用 derive 时可省略 */
   at?: Vec3Like;
   /**
+   * 只参与计算、不画出来（不画球、不标字母、不进高亮）。
+   *
+   * 为什么要它？翻折题最典型：折之前 A 在那个位置，折起来之后它变成 A₁，
+   * 图里不该同时出现两个 A。但 A 的坐标是算 A₁ 的**输入**，而且讲稿正文里
+   * 一定会提到"把 △ABE 折起"——所以它得存在，只是不该出现在画面上。
+   */
+  hidden?: boolean;
+  /**
    * 派生点：坐标由程序算。和 2D 一样的理由——
    * 模型算空间几何公式（重心、垂足、定比分点）几乎必错，但它会声明关系。
    */
@@ -78,7 +86,24 @@ export type Derive3Spec =
    */
   | { kind: 'circumcenter'; points: [string, string, string, string] }
   /** 四面体 A B C D 的内心（内切球心，到四个面等距） */
-  | { kind: 'incenter'; points: [string, string, string, string] };
+  | { kind: 'incenter'; points: [string, string, string, string] }
+  /**
+   * 翻折：把点 `of` 绕直线 `crease` 转过 `deg` 度。
+   *
+   * 为什么必须由程序算？——这是模型最容易翻车的一步，没有之一。
+   * 绕空间里一条斜轴转 90°，手算要先投影、再取正交基、再代旋转公式；
+   * 模型给出的坐标通常"看起来像那么回事"，但垂直关系差个十几度，
+   * 于是断言（A₁O ⊥ BE）写着是对的、图是错的，学生照着错图记对结论。
+   *
+   * 声明方式只要求写**展开状态**的平面图（2D，模型基本不会错）：
+   *   {"type":"point3","id":"A","at":"-1, 1.732, 0","hidden":true}
+   *   {"type":"point3","id":"A1","label":"A₁",
+   *    "derive":{"kind":"fold","of":"A","crease":["B","E"],"deg":90}}
+   *
+   * 方向约定：折起来的那块朝 **+z** 抬（数值探一次，符号写死在算出来的式子里）。
+   * 所以 crease 两个端点谁写在前面都一样。参数化场景探不出数值时按正方向。
+   */
+  | { kind: 'fold'; of: string; crease: [string, string]; deg: number };
 
 /** 棱：连接两个已声明的顶点 */
 export interface Edge3Object extends Base3D {
@@ -246,6 +271,30 @@ export interface Camera3D {
   fov?: number;
 }
 
+/**
+ * 翻折声明：把「moving 这一块平面」沿折痕 crease 折起 deg 度。
+ *
+ * 为什么需要单独声明？——"将△ABD 沿 BD 折起，使平面 ABD ⊥ 平面 CBD"
+ * 是立体几何最经典的一类题，核心画面就是**折起来的那个过程**。
+ * 一张静态的折好图讲不了这件事：学生看不出哪一块是折上去的，
+ * 也看不出折起角到底是多少。
+ *
+ * 关键约定：**场景里的坐标是折好之后的样子**。
+ * 展开状态由程序反推（把 moving 绕折痕转回去 −deg），模型不需要给两套坐标
+ * ——让它同时写"折前"和"折后"两套坐标，等于请它算两遍刚体变换，必错。
+ *
+ * 代价：moving 必须真的是一块平面（与折痕共面），否则"折回去"不是展开而是扭麻花。
+ * 体检器会核这一条（verifier3d 的 checkFold）。
+ */
+export interface FoldSpec {
+  /** 折痕的两个端点（顶点 id）。折痕上线不动，always 是转轴 */
+  crease: [string, string];
+  /** 跟着折起来的那一块的全部顶点 id（含折痕上的两个端点也行，它们不动） */
+  moving: string[];
+  /** 折起角（度）：0 = 完全展开，90 = 折成直角。写的是场景当前所在的那个角 */
+  deg: number;
+}
+
 export interface Scene3D {
   /** 判别字段：main.ts 靠它决定交给哪个渲染器 */
   space: '3d';
@@ -253,6 +302,8 @@ export interface Scene3D {
   params: ParamDef[];
   objects: Scene3DObject[];
   camera?: Camera3D;
+  /** 本题是一道折起题：声明折痕、折起的那一块、折起角 */
+  fold?: FoldSpec;
   /**
    * 是否画坐标轴（x/y/z 三根带箭头的方向轴）。
    *

@@ -10,6 +10,7 @@
 
 import type { Scene3D, Scene3DObject } from './scene3d';
 import { resolveScene3D } from './resolve3d';
+import { parseJsonLoose } from './jsonRepair';
 import { normalizeExpr, splitTopLevel } from './expr';
 
 export type ParseResult3D =
@@ -25,7 +26,7 @@ const OBJECT_TYPES_3D = [
   'sphere3',
   'section3',
 ];
-const DERIVE_KINDS = ['midpoint', 'intersect', 'centroid', 'section', 'foot', 'circumcenter', 'incenter'];
+const DERIVE_KINDS = ['midpoint', 'intersect', 'centroid', 'section', 'foot', 'circumcenter', 'incenter', 'fold'];
 
 /** 点引用能不能用（顶点 id 字符串，或 "x, y, z" 坐标） */
 function pointRefProblem(v: unknown, field: string): string | null {
@@ -74,7 +75,9 @@ export function parseScene3D(input: string): ParseResult3D {
 
   let data: any;
   try {
-    data = JSON.parse(input);
+    // 先原样解析；失败时内部会试一遍"修语法"（尾逗号/缺逗号/注释/截断），
+    // 修不动才把原始错误抛出来。见 jsonRepair.ts
+    data = parseJsonLoose(input);
   } catch (e) {
     return { ok: false, errors: [`不是合法的 JSON：${(e as Error).message}`] };
   }
@@ -144,13 +147,21 @@ export function parseScene3D(input: string): ParseResult3D {
                   typeof d.b !== 'string' ||
                   (typeof d.t !== 'number' && typeof d.t !== 'string'))) ||
               (d.kind === 'foot' &&
-                (typeof d.p !== 'string' || !Array.isArray(d.line) || d.line.length !== 2));
+                (typeof d.p !== 'string' || !Array.isArray(d.line) || d.line.length !== 2)) ||
+              (d.kind === 'fold' &&
+                (typeof d.of !== 'string' ||
+                  !Array.isArray(d.crease) ||
+                  d.crease.length !== 2 ||
+                  typeof d.crease[0] !== 'string' ||
+                  typeof d.crease[1] !== 'string' ||
+                  typeof d.deg !== 'number'));
             if (bad) {
               errors.push(
                 `objects[${i}]（point3）的 derive 缺少必要字段：midpoint 要 a/b，` +
                   `intersect 要 l1[2] 和 l2[2]（两条直线各两个端点），` +
                   `centroid 要 points[3]，circumcenter/incenter 要 points[4]，` +
-                  `section 要 a/b/t，foot 要 p 和 line[2]`,
+                  `section 要 a/b/t，foot 要 p 和 line[2]，` +
+                  `fold 要 of（折的是哪个点）和 crease[2]（折痕两端）和 deg（度数，数字）`,
               );
             }
           } else if (o.at === undefined) {
@@ -356,6 +367,27 @@ export function parseScene3D(input: string): ParseResult3D {
     errors.push('constraints 必须是数组（每项是一条立体几何关系声明）');
   }
 
+  // fold：可选；形状必须对得上，语义（点是否存在、是否共面）交给体检器
+  if (data.fold !== undefined) {
+    const f = data.fold;
+    if (!f || typeof f !== 'object') {
+      errors.push('fold 必须是对象，如 { "crease": ["B","D"], "moving": ["A","B","D"], "deg": 90 }');
+    } else {
+      const cr = (f as any).crease;
+      if (!(Array.isArray(cr) && cr.length === 2 && cr.every((x: any) => typeof x === 'string'))) {
+        errors.push('fold.crease 必须是两个顶点 id 的数组（折痕的两个端点）');
+      }
+      const mv = (f as any).moving;
+      if (!(Array.isArray(mv) && mv.length >= 3 && mv.every((x: any) => typeof x === 'string'))) {
+        errors.push('fold.moving 必须是至少 3 个顶点 id 的数组（跟着折起来的那一块）');
+      }
+      const d = (f as any).deg;
+      if (typeof d !== 'number' || !isFinite(d) || d <= 0 || d >= 180) {
+        errors.push('fold.deg 必须是 0~180 之间的数字（度），如 90');
+      }
+    }
+  }
+
   if (errors.length > 0) return { ok: false, errors };
 
   const scene: Scene3D = {
@@ -367,6 +399,7 @@ export function parseScene3D(input: string): ParseResult3D {
     params: Array.isArray(data.params) ? data.params : [],
     objects: data.objects as Scene3DObject[],
     camera: data.camera,
+    fold: data.fold,
     readouts: Array.isArray(data.readouts) ? data.readouts : [],
     steps: Array.isArray(data.steps) ? data.steps : undefined,
     constraints: Array.isArray(data.constraints) ? data.constraints : undefined,

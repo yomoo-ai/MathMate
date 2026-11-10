@@ -11,6 +11,7 @@
 
 import type { Scene } from './scene';
 import { resolveScene } from './resolve';
+import { parseJsonLoose } from './jsonRepair';
 
 export type ParseResult =
   | { ok: true; scene: Scene }
@@ -32,7 +33,8 @@ export function parseScene(input: string): ParseResult {
 
   let data: any;
   try {
-    data = JSON.parse(input);
+    // 与 3D 共用同一个容错解析器：语法层的小毛病不该烧掉一次生成
+    data = parseJsonLoose(input);
   } catch (e) {
     return { ok: false, errors: [`不是合法的 JSON：${(e as Error).message}`] };
   }

@@ -18,6 +18,7 @@ import type {
   Constraint3,
   Curved3Object,
   Face3Object,
+  Point3Object,
   PointRef,
   Scene3D,
   Scene3DObject,
@@ -40,6 +41,7 @@ import {
   type Scope,
 } from './expr';
 import { evalPointRef } from './resolve3d';
+import { foldAngleFrom, planFold } from './fold3d';
 import type { Issue } from './verifier';
 
 type V3 = [number, number, number];
@@ -147,14 +149,27 @@ function collectPoints(scene: Scene3D, scope: Record<string, number>): {
 }
 
 /** 顶点两两重合 / 整体共面 —— 立体几何里这两件事都必然是构造错误 */
+interface SanityResult {
+  issues: Issue[];
+  /**
+   * 整个图形退化（所有顶点共面 / 共线）——这是**根因**。
+   * 上层拿到它之后只回传这一条：顶点重合、垂直不成立、截面退化……
+   * 几乎全是"图形没有厚度"的连带现象，一次报 9 条模型只会去改症状。
+   */
+  degenerate: Issue | null;
+  /** 退化时被合并掉的同类错误条数（"顶点重合"这类），只用于报"另有 N 条" */
+  suppressed: number;
+}
+
 function checkGeometrySanity(
   pts: Map<string, V3>,
   hasCurved: boolean,
   /** 允许与别的点重合的顶点（球心这类"结构点"，见下方说明） */
   allowed: Set<string>,
-): Issue[] {
+): SanityResult {
   const issues: Issue[] = [];
   const ids = [...pts.keys()];
+  let degenerate: Issue | null = null;
 
   // ① 重合：全量两两比较（顶点也就几十个）
   //
@@ -196,7 +211,18 @@ function checkGeometrySanity(
         }
       }
     }
-    if (plane) {
+
+    // 连一个不共线的三点都找不出来 → 所有点都在同一条直线上（或互相重合）
+    if (!plane) {
+      degenerate = {
+        level: 'error',
+        where: 'objects',
+        message:
+          `所有 ${ids.length} 个顶点都在同一条直线上（或互相重合）——这不是立体图形，` +
+          `画出来只会是一条线。检查坐标：底面要给 x、y 两个方向的值，` +
+          `上层顶点还要给 z（如 z=h），不能所有点都只改动一个坐标`,
+      };
+    } else {
       const [ia, ib, ic] = plane;
       const A = pts.get(ia)!, B = pts.get(ib)!, C = pts.get(ic)!;
       const scale = Math.max(
@@ -214,18 +240,25 @@ function checkGeometrySanity(
         }
       }
       if (maxOff / scale <= TIGHT) {
-        issues.push({
+        degenerate = {
           level: 'error',
           where: 'objects',
           message:
-            `所有 ${ids.length} 个顶点都落在同一个平面上（最偏离的 ${worst} 只差 ${maxOff.toFixed(4)}）——` +
-            `这不是立体图形。检查是不是漏了高度：底面放 z=0，顶点/上层顶点要给 z（如 z=h）`,
-        });
+            `所有 ${ids.length} 个顶点都落在同一个平面上` +
+            (worst
+              ? `（最偏离的 ${worst} 也只差 ${maxOff.toFixed(4)}）`
+              : `（零偏差，严格共面）`) +
+            `——这不是立体图形。检查是不是漏了高度：` +
+            `底面放 z=0，顶点/上层顶点要给 z（如 z=h）`,
+        };
       }
     }
   }
 
-  return issues;
+  // 退化时真正的根因是"没有厚度"，那几条"顶点重合"多半是同一个原因造成的
+  // （上层顶点照抄了底层坐标）→ 一并交给上层按根因处理，不重复报。
+  if (degenerate) return { issues: [], degenerate, suppressed: issues.length };
+  return { issues, degenerate: null, suppressed: 0 };
 }
 
 /** 棱：端点必须存在、不能退化成点；被面覆盖情况影响虚实判断 */
@@ -396,7 +429,16 @@ function checkIsolatedPoints(scene: Scene3D, pts: Map<string, V3>): Issue[] {  c
     for (const m of norm.matchAll(re)) used.add(m[2]);
   }
   const issues: Issue[] = [];
+  const hiddenIds = new Set<string>();
+  for (const obj of scene.objects) {
+    if (obj.type !== 'point3') continue;
+    if ((obj as Point3Object).hidden) hiddenIds.add(obj.id);
+    // 折前点只提供坐标（derive.of），本来就不画，谈不上"孤立"
+    const d = (obj as Point3Object).derive;
+    if (d && d.kind === 'fold') hiddenIds.add(d.of);
+  }
   for (const id of pts.keys()) {
+    if (hiddenIds.has(id)) continue;
     if (!used.has(id)) {
       issues.push({
         level: 'warn',
@@ -1205,6 +1247,263 @@ function checkCamera(scene: Scene3D): Issue[] {
 }
 
 // ---------------------------------------------------------------
+// 翻折声明
+// ---------------------------------------------------------------
+
+/**
+ * 核 fold 声明：折痕、折起的那一块、折起角对不对得上。
+ *
+ * 一律只报 warn，不拦生成——翻折只是"讲解时演一段动画"，图本身可能是对的。
+ * 核不过的 fold 播放器会安静地跳过（见 core/renderer3d 的 setFoldOffset），
+ * 视频退化成静态折好图，不至于整道题重出。
+ *
+ * 其中最有价值的一条是**实测折起角**：模型经常把 90° 的图画成 60°，
+ * 而声明写 90°，结果展开再折回去时那块平面像自己往上翘。
+ */
+function checkFold(scene: Scene3D, pts: Map<string, V3>): Issue[] {
+  const fold = scene.fold;
+  if (!fold) return [];
+
+  const issues: Issue[] = [];
+  const { plan, why } = planFold(fold, pts);
+  if (!plan) {
+    issues.push({
+      level: 'warn',
+      where: 'fold',
+      message: `翻折声明不能用（${why}），视频里不会演折起过程，只显示静态图`,
+    });
+    return issues;
+  }
+
+  // 截面/旋转体的几何每帧都要按点重算，和"点会动"这件事打架；播放器直接不演
+  const blockers = scene.objects.filter((o) => o.type === 'section3' || isCurved3(o)).map((o) => o.id);
+  if (blockers.length > 0) {
+    issues.push({
+      level: 'warn',
+      where: 'fold',
+      message: `本题有 ${blockers.join('、')}（截面/旋转体），翻折动画已停用——这两类图形每帧都要按顶点重算，点一动就画歪。静态图不受影响`,
+    });
+    return issues;
+  }
+
+  // 实测折起角：折痕两侧各取一个"离轴最远"的样本点，量它们垂直于轴的方向夹角
+  const axis = sub3(plan.b, plan.a);
+  const axisLen = len3(axis);
+  const u: V3 = [axis[0] / axisLen, axis[1] / axisLen, axis[2] / axisLen];
+  const perpDist = (p: V3): number => {
+    const v = sub3(p, plan.a);
+    const d = dot3(v, u);
+    return len3([v[0] - u[0] * d, v[1] - u[1] * d, v[2] - u[2] * d]);
+  };
+  const movingSet = new Set(plan.ids);
+  let movingSample: V3 | null = null;
+  let movingBest = 0;
+  for (const id of plan.ids) {
+    const p = pts.get(id);
+    if (!p) continue;
+    const d = perpDist(p);
+    if (d > movingBest) {
+      movingBest = d;
+      movingSample = p;
+    }
+  }
+  let fixedSample: V3 | null = null;
+  let fixedBest = 0;
+  // hidden 点（折前位置）不算"固定块"的样本：它不在画面上，
+  // 而且它本来就躺在展开时的那个平面里，拿它量二面角会量出 180°
+  const hiddenIds = new Set(
+    scene.objects
+      .filter((o) => o.type === 'point3' && (o as { hidden?: boolean }).hidden === true)
+      .map((o) => o.id),
+  );
+  for (const [id, p] of pts) {
+    if (movingSet.has(id) || hiddenIds.has(id)) continue;
+    if (id === fold.crease[0] || id === fold.crease[1]) continue;
+    const d = perpDist(p);
+    if (d > fixedBest) {
+      fixedBest = d;
+      fixedSample = p;
+    }
+  }
+  if (movingSample && fixedSample) {
+    const got = foldAngleFrom(plan, movingSample, fixedSample);
+    if (got !== null && Math.abs(got - fold.deg) > 1.5) {
+      issues.push({
+        level: 'warn',
+        where: 'fold',
+        message:
+          `fold.deg 写的是 ${fold.deg}°，实测折起角是 ${got.toFixed(1)}°。` +
+          `展开→折起的动画会把这两者的差补上（画面上会多折 ${Math.abs(got - fold.deg).toFixed(0)}°），` +
+          `要么把顶点坐标折到位，要么把 deg 改成实测值`,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * 折后点（derive.kind = 'fold'）的体检。
+ *
+ * 为什么这类点也要单独查？——它把"算坐标"这件事从模型手里拿走了，
+ * 但**关系**还留在模型手里：折的是哪个点、绕哪条折痕、多少度。
+ * 写错关系照样是错的图，而且错得很隐蔽（程序会算出一个精确的错位置）。
+ */
+function checkFoldDerives(scene: Scene3D, pts: Map<string, V3>): Issue[] {
+  const issues: Issue[] = [];
+  const byId = new Map<string, Point3Object>();
+  for (const o of scene.objects) {
+    if (o.type === 'point3') byId.set(o.id, o as Point3Object);
+  }
+
+  scene.objects.forEach((o, i) => {
+    if (o.type !== 'point3') return;
+    const d = (o as Point3Object).derive;
+    if (!d || d.kind !== 'fold') return;
+    const tag = `objects[${i}]（${o.id} 的 fold）`;
+
+    if (!byId.has(d.of)) {
+      issues.push({
+        level: 'error',
+        where: `objects[${i}]`,
+        message:
+          `${tag}：要折的点「${d.of}」没在 objects 里声明。` +
+          `折前的点连坐标一起补上、标 hidden:true（不画出来），` +
+          `例如 {"type":"point3","id":"${d.of}","at":"折前坐标","hidden":true}`,
+      });
+      return;
+    }
+    const c1 = pts.get(d.crease[0]);
+    const c2 = pts.get(d.crease[1]);
+    if (!c1 || !c2) {
+      const bad = [d.crease[0], d.crease[1]].filter((id) => !pts.get(id));
+      issues.push({
+        level: 'error',
+        where: `objects[${i}]`,
+        message: `${tag}：折痕端点 ${bad.join('、')} 图里没有——折痕只能取已声明的顶点`,
+      });
+      return;
+    }
+    if (!(d.deg > 0 && d.deg < 180)) {
+      issues.push({
+        level: 'error',
+        where: `objects[${i}]`,
+        message: `${tag}：折起角 ${d.deg}° 不合理，应当严格在 0° 和 180° 之间（90 = 折成直角）`,
+      });
+      return;
+    }
+    const src = pts.get(d.of);
+    if (src) {
+      const ax = sub3(c2, c1);
+      const axLen = len3(ax);
+      if (axLen < 1e-9) {
+        issues.push({
+          level: 'error',
+          where: `objects[${i}]`,
+          message: `${tag}：折痕两端 ${d.crease[0]}、${d.crease[1]} 重合，折痕长度为 0`,
+        });
+        return;
+      }
+      const v = sub3(src, c1);
+      const off = len3(cross3(v, ax)) / axLen;
+      const scale = Math.max(1, axLen);
+      if (off < 1e-6 * scale) {
+        issues.push({
+          level: 'error',
+          where: `objects[${i}]`,
+          message:
+            `${tag}：「${d.of}」本身落在折痕 ${d.crease[0]}${d.crease[1]} 上，绕它转多少度都不动。` +
+            `折的是**离开折痕的那一块**，检查一下 of 是不是写成了折痕上的点`,
+        });
+        return;
+      }
+    } else {
+      issues.push({
+        level: 'error',
+        where: `objects[${i}]`,
+        message: `${tag}：${d.of} 的坐标算不出来（它自己的 at/derive 有问题），折后点跟着算不出`,
+      });
+      return;
+    }
+
+    // 和动画声明对账：坐标按 60° 折、动画按 90° 演，画面上会"多折一截"
+    const fold = scene.fold;
+    if (fold) {
+      const same =
+        (fold.crease[0] === d.crease[0] && fold.crease[1] === d.crease[1]) ||
+        (fold.crease[0] === d.crease[1] && fold.crease[1] === d.crease[0]);
+      if (!same) {
+        issues.push({
+          level: 'warn',
+          where: 'fold',
+          message:
+            `坐标是按折痕 ${d.crease[0]}${d.crease[1]} 算的，动画声明的是 ` +
+            `${fold.crease[0]}${fold.crease[1]}——两处折痕不一致，演起来会扭`,
+        });
+      } else if (Math.abs(fold.deg - d.deg) > 0.5) {
+        issues.push({
+          level: 'error',
+          where: 'fold',
+          message:
+            `坐标按 ${d.deg}° 折好了，动画的 fold.deg 却写 ${fold.deg}°——` +
+            `展开再折回时，回到的那个位置和算好的坐标差 ${Math.abs(fold.deg - d.deg).toFixed(0)}°。两边改成同一个角`,
+        });
+      } else if (!fold.moving.includes(o.id)) {
+        issues.push({
+          level: 'warn',
+          where: 'fold',
+          message:
+            `${o.id} 的坐标是按翻折算的，但 fold.moving 里没列它——` +
+            `演折起动画时它会留在折好的位置不动，被折回去的是旁边那几个点`,
+        });
+      }
+    }
+  });
+
+  return issues;
+}
+
+/**
+ * 「题面明明说了折起，图里却没有 fold 声明」——提醒一句。
+ *
+ * 2026-11-09 那次就是这样：模型手写了折后坐标（还没算对），
+ * 既没写 fold、也没用 derive。它的断言写得漂亮，图是错的，
+ * 体检只报"垂直不成立"，它不知道真正该做的是"把这一步交给程序"。
+ *
+ * 只给 warn、不拦：很多题只是出现「二面角」这个词（求二面角并不等于要演折起），
+ * 拦下来会误伤一大片。warn 会随错误一起回传，模型看得见就够了。
+ */
+function checkFoldMissing(scene: Scene3D): Issue[] {
+  const hasDerive = scene.objects.some(
+    (o) => o.type === 'point3' && (o as Point3Object).derive?.kind === 'fold',
+  );
+  if (scene.fold || hasDerive) return [];
+
+  const text = [
+    scene.meta?.title ?? '',
+    scene.meta?.subtitle ?? '',
+    ...(scene.steps ?? []).map((s) => String(s.text ?? '')),
+  ].join(' ');
+  if (!/折起|翻折|折叠/.test(text)) return [];
+  // 已经在正文里明确"折起到……的位置"，才算真在讲折叠动作
+  if (!/折起到|折起至|翻折到|折叠到|折成/.test(text)) return [];
+
+  return [
+    {
+      level: 'warn',
+      where: 'fold',
+      message:
+        '题面写的是折起/翻折，但这张图既没有 fold 声明、也没有折后点的 derive——' +
+        '说明折后的坐标是手写的。绕空间斜轴转一个角手算必错，而且错了看不出来：' +
+        '断言（如 A₁O ⊥ BE）可能写着是对的，坐标已经偏了。' +
+        '改法：按展开态写全部顶点，折起来的点用 ' +
+        '{"derive":{"kind":"fold","of":"A","crease":["B","E"],"deg":90}} 让程序算，' +
+        '再补 "fold":{"crease":["B","E"],"moving":["A1","B","E"],"deg":90} 让视频演折起过程',
+    },
+  ];
+}
+
+// ---------------------------------------------------------------
 // 主入口
 // ---------------------------------------------------------------
 
@@ -1356,14 +1655,52 @@ function checkStepPointRefs(scene: Scene3D, pts: Map<string, V3>): Issue[] {
   const steps = scene.steps ?? [];
   if (steps.length === 0 || pts.size < 3) return [];
 
-  const declared = new Set<string>();
+  /** 画面上真的有点、有字母的那些名字（报错文案里用它当"图上有哪些点"） */
+  const drawn = new Set<string>();
+  /** 可以在正文里出现的名字：画出来的 + 只参与计算的那些 */
+  const known = new Set<string>();
+  const noteName = (v: unknown) => {
+    if (typeof v !== 'string' || v.trim() === '') return null;
+    const n = normalizeVertexToken(v);
+    drawn.add(n);
+    known.add(n);
+    return n;
+  };
   for (const o of scene.objects) {
     if (o.type !== 'point3') continue;
-    declared.add(normalizeVertexToken(o.id));
-    if (typeof (o as { label?: unknown }).label === 'string') {
-      declared.add(normalizeVertexToken((o as { label: string }).label));
+    const hidden = (o as { hidden?: boolean }).hidden === true;
+    if (hidden) {
+      // 折前的 A：图上是 A₁，但正文写"把 △ABE 折起"时提到 A 完全正常
+      if (typeof o.id === 'string') known.add(normalizeVertexToken(o.id));
+      if (typeof o.label === 'string') known.add(normalizeVertexToken(o.label));
+      continue;
+    }
+    noteName(o.id);
+    noteName(o.label);
+    // 折出来的点，正文里提它的"前身"（derive.of）也是对的
+    const d = (o as { derive?: { kind?: string; of?: unknown } }).derive;
+    if (d && d.kind === 'fold' && typeof d.of === 'string') {
+      known.add(normalizeVertexToken(d.of));
     }
   }
+
+  /**
+   * 假设点（"是否存在点 P"、"设点 P 在 A₁C 上"）不该被要求画出来——
+   * 存在性问题的答案是"存在/不存在"，先把点画在某个位置反而误导。
+   * 只认"点 X"这种明确写法，且小句里得有存在/假设的口气，
+   * 避免把"设 O 为对角线的交点"这类真正该画的点也放过。
+   */
+  const hypothetical = (clause: string): Set<string> => {
+    const out = new Set<string>();
+    if (!/是否存在|存在|假设|不妨设|任取|设点|若点/.test(clause)) return out;
+    // "设点 O 为对角线交点"是**定义**一个该画的点，不是假设点——放过它就漏了
+    if (/中点|交点|垂足|重心|外心|内心|中心|分点/.test(clause)) return out;
+    for (const m of clause.matchAll(/点\s*([A-Z]\d?)/g)) out.add(normalizeVertexToken(m[1]));
+    for (const m of clause.matchAll(/(?:^|[^A-Za-z0-9])([A-Z]\d?)\s*点/g)) {
+      out.add(normalizeVertexToken(m[1]));
+    }
+    return out;
+  };
 
   const issues: Issue[] = [];
   steps.forEach((step, i) => {
@@ -1372,11 +1709,13 @@ function checkStepPointRefs(scene: Scene3D, pts: Map<string, V3>): Issue[] {
     for (const clause of text.split(CLAUSE_SPLIT)) {
       if (!POINT_CONTEXT.test(clause)) continue;
       const norm = normalizeVertexToken(clause);
+      const hyp = hypothetical(norm);
       // 独立出现的 大写字母 + 可选数字；前后不能粘连其它字母数字
       const re = /(^|[^A-Za-z0-9])([A-Z]\d?)(?![A-Za-z0-9])/g;
       for (const m of norm.matchAll(re)) {
         const name = m[2];
-        if (!declared.has(name)) missing.add(name);
+        if (known.has(name) || hyp.has(name)) continue;
+        missing.add(name);
       }
     }
     if (missing.size === 0) return;
@@ -1386,7 +1725,7 @@ function checkStepPointRefs(scene: Scene3D, pts: Map<string, V3>): Issue[] {
       where: `steps[${i}]`,
       message:
         `第 ${i + 1} 步的文字里点了 ${list.join('、')} 这几个点，但图里没有它们` +
-        `（objects 里声明的顶点是 ${[...declared].join('、')}）——` +
+        `（objects 里声明的顶点是 ${[...drawn].join('、')}）——` +
         `读者会看到"讲解提到、图上找不到"。三选一：` +
         `① 这些点确实要画：在 objects 里补 point3，用 derive 让程序算坐标` +
         `（延长线交点用 intersect、中点用 midpoint、定比分点用 section），` +
@@ -1396,6 +1735,154 @@ function checkStepPointRefs(scene: Scene3D, pts: Map<string, V3>): Issue[] {
         `③ 不需要标到图上：把这句话删掉或改写，不要出现没画出来的点`,
     });
   });
+  return issues;
+}
+
+/* ===============================================================
+ * 「平面 X ∩ 平面 Y = PQ」——中文教材的标准写法，程序必须核对
+ *
+ * 这类断言很容易写错：把"看起来在该面上的一条线"当成交线（如把 AC 写成
+ * 平面 A₁BD 与底面的交线）。错了图还是对的，只有文字错，学生照着记就记反了。
+ *
+ * 判定原则：
+ *   ① 只认严格句式，名字必须能按已声明顶点**完整拆开**，否则静默跳过（绝不猜）
+ *   ② 两个平面平行/重合 → 根本交不出这条线
+ *   ③ 交线端点必须**同时落在两个平面上**（到两平面距离都在容差内）
+ * =============================================================== */
+
+/** 把「A1BD」这种连写名字按已声明顶点拆成 id 列表；拆不干净返回 null */
+function splitVertexRun(token: string, byNorm: Map<string, string>): string[] | null {
+  const norm = normalizeVertexToken(token);
+  const pool = [...byNorm.keys()].sort((a, b) => b.length - a.length);
+  const out: string[] = [];
+  let i = 0;
+  while (i < norm.length) {
+    const hit = pool.find((id) => norm.startsWith(id, i));
+    if (!hit) return null;
+    out.push(byNorm.get(hit)!);
+    i += hit.length;
+  }
+  return out;
+}
+
+/** 由一组顶点定一张平面（用不共线的三点），定不出来返回 null */
+function planeOfIds(
+  ids: string[],
+  pts: Map<string, V3>,
+): { a: V3; b: V3; c: V3; n: V3 } | null {
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      for (let k = j + 1; k < ids.length; k++) {
+        const A = pts.get(ids[i]);
+        const B = pts.get(ids[j]);
+        const C = pts.get(ids[k]);
+        if (!A || !B || !C) continue;
+        const n = cross3(sub3(B, A), sub3(C, A));
+        if (len3(n) > 1e-9) return { a: A, b: B, c: C, n };
+      }
+    }
+  }
+  return null;
+}
+
+function checkPlaneIntersectClaims(scene: Scene3D, pts: Map<string, V3>): Issue[] {
+  const ids = [...pts.keys()];
+  if (ids.length < 5 || !(scene.steps ?? []).length) return [];
+
+  const byNorm = new Map<string, string>();
+  for (const id of ids) {
+    const key = normalizeVertexToken(id);
+    if (!byNorm.has(key)) byNorm.set(key, id);
+  }
+
+  let scale = 1;
+  for (const p of pts.values()) {
+    scale = Math.max(scale, Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2]));
+  }
+  const tol = REL_TOL * scale;
+
+  // 只认两种教材写法：`平面X ∩ 平面Y = PQ`、`平面X 与 平面Y 交于(直线) PQ`
+  const RUN = '[A-Za-z0-9₀-₉]{2,12}';
+  const patterns = [
+    new RegExp(`平面\\s*(${RUN})\\s*[∩∩]\\s*平面\\s*(${RUN})\\s*(?:=|＝|为)\\s*(${RUN})`, 'g'),
+    new RegExp(`平面\\s*(${RUN})\\s*(?:与|和)\\s*平面\\s*(${RUN})\\s*交于\\s*(?:直线)?\\s*(${RUN})`, 'g'),
+  ];
+
+  const issues: Issue[] = [];
+  const seen = new Set<string>();
+
+  (scene.steps ?? []).forEach((step, si) => {
+    const text = String(step.text ?? '');
+    for (const re of patterns) {
+      re.lastIndex = 0;
+      for (const m of text.matchAll(re)) {
+        const [whole, n1, n2, lineTok] = m;
+        if (n1 === n2) continue;
+
+        const p1 = splitVertexRun(n1, byNorm);
+        const p2 = splitVertexRun(n2, byNorm);
+        const ends = splitVertexRun(lineTok, byNorm);
+        // 名字里有点没声明的字母 → 拆不干净，不猜（缺点由 checkStepPointRefs 报）
+        if (!p1 || !p2 || !ends) continue;
+        if (new Set(p1).size < 3 || new Set(p2).size < 3) continue;
+        if (new Set(ends).size !== 2) continue;
+
+        const key = `${n1}|${n2}|${lineTok}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const pl1 = planeOfIds(p1, pts);
+        const pl2 = planeOfIds(p2, pts);
+        if (!pl1 || !pl2) continue; // 点共线等，交给别的检查
+
+        const n1u = mul3(pl1.n, 1 / len3(pl1.n));
+        const n2u = mul3(pl2.n, 1 / len3(pl2.n));
+        const half = len3(cross3(n1u, n2u));
+
+        if (half <= 1e-6) {
+          // 平行或重合
+          const gap = Math.abs(dot3(sub3(pl2.a, pl1.a), n1u));
+          const where = `steps[${si}]`;
+          issues.push({
+            level: 'error',
+            where,
+            message:
+              gap <= tol
+                ? `第 ${si + 1} 步写「${whole}」，但平面 ${n1} 与平面 ${n2} 是**同一个平面**（重合），` +
+                  `重合的平面交不出唯一的一条直线。换个说法，或重新确认这两个平面的顶点`
+                : `第 ${si + 1} 步写「${whole}」，但平面 ${n1} 与平面 ${n2} 是**平行**的` +
+                  `（法向夹角实测 ${(Math.asin(Math.min(1, half)) * 180 / Math.PI).toFixed(1)}°，间距 ${gap.toFixed(3)}），` +
+                  `平行平面没有交线。先确认这两组顶点各自是不是在同一个平面上`,
+          });
+          continue;
+        }
+
+        // 交线存在 → 端点必须同时落在两个平面上
+        const bad: string[] = [];
+        for (const id of ends) {
+          const P = pts.get(id);
+          if (!P) continue;
+          const d1 = Math.abs(dot3(sub3(P, pl1.a), n1u));
+          const d2 = Math.abs(dot3(sub3(P, pl2.a), n2u));
+          if (Math.max(d1, d2) > tol) {
+            bad.push(`${id}${fmtV(P)}（到平面 ${n1} 距离 ${d1.toFixed(3)}、到平面 ${n2} 距离 ${d2.toFixed(3)}）`);
+          }
+        }
+        if (bad.length === 0) continue;
+
+        issues.push({
+          level: 'error',
+          where: `steps[${si}]`,
+          message:
+            `第 ${si + 1} 步写「${whole}」，但交线上的端点不在两个平面上：${bad.join('；')}。` +
+            `两平面的交线必须**同时属于这两个平面**——` +
+            `端点要么换成同时在这两个面上的两个点，要么改成"这条线在其中一个面上"的表述，` +
+            `不要把它写成两面的交线`,
+        });
+      }
+    }
+  });
+
   return issues;
 }
 
@@ -1413,14 +1900,17 @@ export function verifyScene3D(scene: Scene3D): Issue[] {
     }
   }
 
-  return [
+  const sanity = checkGeometrySanity(pts, hasCurved, specialPoints);
+
+  const all: Issue[] = [
     ...pointIssues,
-    ...checkGeometrySanity(pts, hasCurved, specialPoints),
+    ...sanity.issues,
     ...checkEdges(scene, pts),
     ...checkFaces(scene, pts),
     ...solidSpecs.issues,
     ...checkSections(scene, pts, scope, solidSpecs.specs),
     ...checkSectionClaims(scene),
+    ...checkPlaneIntersectClaims(scene, pts),
     ...checkIntersectDerives(scene, pts),
     ...checkStepPointRefs(scene, pts),
     ...checkIsolatedPoints(scene, pts),
@@ -1428,5 +1918,24 @@ export function verifyScene3D(scene: Scene3D): Issue[] {
     ...checkReadouts(scene, scope),
     ...checkSteps(scene),
     ...checkCamera(scene),
+    ...checkFold(scene, pts),
+    ...checkFoldDerives(scene, pts),
+    ...checkFoldMissing(scene),
   ];
+
+  // 图形整体被压扁（全部点共面/共线）时，只回传这一条根因。
+  //
+  // 真实事故：立方体 8 个顶点 z 全 0，体检报 9 条 error，根因「所有顶点共面」
+  // 排在第 5 位，前后是"顶点重合""AB ⊥ AA₁ 不成立"这些**症状**。
+  // 模型照着症状改，改了 3 轮越改越偏。补上高度后 7 条会自动消失。
+  if (sanity.degenerate) {
+    const extra = all.filter((i) => i.level === 'error').length + sanity.suppressed;
+    const note =
+      extra > 0
+        ? `（另有 ${extra} 条错误是图形被压扁的连带现象，先别管它们——把厚度补上，重新体检时会自动消失）`
+        : '';
+    return [...pointIssues, { ...sanity.degenerate, message: sanity.degenerate.message + note }];
+  }
+
+  return all;
 }

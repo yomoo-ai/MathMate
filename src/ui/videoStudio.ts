@@ -29,7 +29,7 @@ import type { Scene, StepDef } from '../protocol/scene';
 import { buildNarration, fallbackNarration } from '../llm/narration';
 import type { Narration } from '../llm/narration';
 import { compileTimeline, sampleBeat } from './timeline';
-import type { Timeline } from './timeline';
+import type { Timeline, TurnCue } from './timeline';
 import { isBoardScene } from '../core/visualMode';
 import { buildAnnotations3D, pickAnnotations3D } from '../core/annotations3d';
 import type { AnnotationMark3D } from '../core/annotations3d';
@@ -179,6 +179,12 @@ export function mountVideoStudio(): VideoStudioHandle {
   let captionLabel = '';
   /** 逐帧动画的 rAF 句柄 */
   let animRaf = 0;
+  /**
+   * 已经触发过的转向（key = 第几句第几个动作）。
+   * 转向不是"每帧的状态"，而是"发生一次的事件"——不去重的话，
+   * 一句话里每个动画帧都会重新开始补间，镜头会一直卡在起步的那一下。
+   */
+  let viewFired = new Set<string>();
 
   // ---- 3D 入场构建动画 ----
   //
@@ -466,6 +472,9 @@ export function mountVideoStudio(): VideoStudioHandle {
       lineWidth: span / 300,
       helperWidth: span / 150,
       boardMode,
+      // 立体题的折起起点：由渲染器按"往哪一边摊"算好（±deg），
+      // 时间轴据此把"折到哪了"编进每一句
+      foldFrom: r3d?.foldFlatOffset(),
     });
 
     progressiveAll = new Set<string>();
@@ -725,11 +734,42 @@ export function mountVideoStudio(): VideoStudioHandle {
       r2d?.setOverlay(frame.overlay);
       if (frame.param) applyParam(frame.param);
     }
+    if (!boardMode && space === '3d') {
+      // 折起：纯数值，每帧照着设就行（和 2D 的扫参同一个路子）
+      if (frame.fold !== undefined) r3d?.setFoldOffset(frame.fold);
+      // 转向：一次性动作，到点只转一次——key 是"第几句第几个动作"，
+      // 每帧重算不会重复触发
+      for (const cue of frame.turns) {
+        if (t < cue.at || viewFired.has(cue.key)) continue;
+        viewFired.add(cue.key);
+        turnTo(cue, cue.dur);
+      }
+    }
     renderBoard(frame.boardCount, frame.boardActive);
     if (frame.label && frame.label !== captionLabel) {
       captionLabel = frame.label;
       subTitleEl.textContent = frame.label;
     }
+  }
+
+  /**
+   * 真的把镜头转过去。
+   *
+   * 转过去的同时**关掉自动慢转**：自动转的用处是让静止的画面上有立体感，
+   * 可一旦讲到"看底面"，镜头还在自己转，三秒之后就转到背面去了，
+   * 讲的话和画面又对不上。所以宁可后半段变成静态图。
+   */
+  function turnTo(cue: TurnCue, dur: number) {
+    if (!r3d) return;
+    r3d.autoRotateSeconds = 0;
+    if (cue.face) {
+      if (r3d.turnToFace(cue.face, dur)) return;
+      // 面不存在（模型编的 id）就退化成"不动"，别把人转到奇怪的地方
+      return;
+    }
+    const az = cue.azimuth ?? r3d.currentAzimuth();
+    const el = cue.elevation ?? r3d.currentElevation();
+    r3d.turnTo(az, el, dur);
   }
 
   /**
@@ -753,8 +793,39 @@ export function mountVideoStudio(): VideoStudioHandle {
       else r2d?.applyFocus(focus, revealed, progressive);
       // 3D 标注只在本句显示：按本句重点挑（挑不中就是空数组 = 清空）。
       // 高亮是对象 id，先翻译成顶点 id 再匹配。
+      //
+      // 摊平状态下一条标注都不给：标注是按**折好之后**的坐标算的，
+      // 图还摊着的时候画上去，弧线和数字会飘在半空（折起那句尤其明显）。
+      // 折好之后（fold 归零）再恢复，坐标就和图对上了。
+      const foldAt = atEnd ? beat.foldEnd : beat.foldStart;
       if (space === '3d' && scene3d) {
-        r3d?.setAnnotations3D(pickAnnotations3D(ann3dAll, focusPointIds(scene3d, focus)));
+        r3d?.setAnnotations3D(
+          foldAt !== 0 ? [] : pickAnnotations3D(ann3dAll, focusPointIds(scene3d, focus)),
+        );
+      }
+      // 折起：跳到某一句时直接落到这句该有的角度（不演过程，演过程是播放时的事）
+      if (space === '3d' && (beat.foldStart !== 0 || beat.foldEnd !== 0)) {
+        r3d?.setFoldOffset(atEnd ? beat.foldEnd : beat.foldStart);
+      }
+      // 转向：翻句时要让镜头落到"这句讲的那个视角"，否则翻到"看底面"那句，
+      // 画面还是上一句的斜视角，话和图对不上。
+      // 只在**手动翻句**时这么干；正常播放时交给时间轴按动作的时刻转（见 applyFrame）。
+      if (space === '3d' && atEnd) {
+        const lastView = [...beat.actions].reverse().find((c) => c.action.kind === 'view');
+        if (lastView && lastView.action.kind === 'view') {
+          viewFired.add(lastView.key);
+          const v = lastView.action;
+          if (v.face) r3d?.turnToFace(v.face, 260);
+          else {
+            r3d?.turnTo(
+              v.azimuth ?? r3d.currentAzimuth(),
+              v.elevation ?? r3d.currentElevation(),
+              260,
+            );
+          }
+          // 手动翻到"看某个面"的句子，之后的自动慢转也该停：否则刚转正又飘走
+          if (r3d) r3d.autoRotateSeconds = 0;
+        }
       }
     }
 
@@ -890,6 +961,9 @@ export function mountVideoStudio(): VideoStudioHandle {
 
     const token = ++playToken;
     playing = true;
+    // 新一轮播放：转向事件表清空，这一遍该转的地方重新转
+    viewFired.clear();
+    if (space === '3d' && r3d) r3d.autoRotateSeconds = AUTO_ROTATE_SECONDS;
     playBtn.textContent = '⏸ 暂停';
     prevBtn.disabled = true;
     nextBtn.disabled = true;
@@ -1135,6 +1209,7 @@ export function mountVideoStudio(): VideoStudioHandle {
       boardShown = -1;
       boardActiveShown = false;
       captionLabel = '';
+      viewFired = new Set();
       boardEl.hidden = true;
       boardBodyEl.innerHTML = '';
       stage.classList.remove('has-board');
@@ -1170,8 +1245,11 @@ export function mountVideoStudio(): VideoStudioHandle {
         modeNoteEl.hidden = false;
       }
 
-      // 先用本地脚本垫一层：一打开就有第一句和板书，不必等模型
-      buildTimeline(fallbackNarration(scene));
+      // 先用本地脚本垫一层：一打开就有第一句和板书，不必等模型。
+      // 注意顺序：这一句必须在渲染器装好场景之后才编时间轴——
+      // 折起的起点（往哪一边摊、多少度）是渲染器按实际坐标算出来的，
+      // 提前编会拿到"没有翻折"，整段视频都不会折。
+      // 所以真正的第一次编译放在下面 setScene 之后。
 
       // 先把对应维度的宿主显示出来，再创建渲染器——
       // 顺序反了的话渲染器会量到 display:none 的 0 尺寸，画面缩成一点
@@ -1183,6 +1261,9 @@ export function mountVideoStudio(): VideoStudioHandle {
           // 立体图要"一直在"，不能被压到几乎透明
           r3d!.dimFactor = 0.55;
           r3d!.setScene(scene3d, vsParams);
+          // 换一道题就把自转与转向状态复位：上一题讲到"看底面"时把自转关了，
+          // 不恢复的话新题一打开就是死画面
+          r3d!.autoRotateSeconds = AUTO_ROTATE_SECONDS;
           // 注意：入场构建不在这里启动。
           // 这个函数在你点「讲解视频」时就跑，而真正开讲还要等你点「播放」、
           // 再等模型拆解讲稿（几秒到十几秒）——动画在这里放，等于放在没人的时候，
@@ -1201,6 +1282,9 @@ export function mountVideoStudio(): VideoStudioHandle {
           r2d!.setScene({ ...scene2d, view: videoView(scene2d) }, vsParams);
         }
       }
+
+      // 第一次编译时间轴：渲染器已就位，折起的起点能算准了
+      buildTimeline(fallbackNarration(scene));
 
       root.scrollIntoView({ behavior: 'smooth', block: 'start' });
 

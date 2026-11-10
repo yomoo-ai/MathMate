@@ -62,7 +62,23 @@ export type Action =
    */
   | { kind: 'param'; name: string; from: number; to: number }
   /** 板书：往右侧黑板添一行推导。text 里可以用 $...$ 写公式 */
-  | { kind: 'board'; text: string; accent?: boolean };
+  | { kind: 'board'; text: string; accent?: boolean }
+  /**
+   * 折起（**仅立体题**）：把场景声明的 fold 从"完全展开"折到折起角。
+   *
+   * 为什么动作里不带折痕和角度：那些都在 scene.fold 里声明过一次了，
+   * 这层只负责"什么时候折"。让模型再抄一遍折痕 id，等于给它一次抄错的机会
+   * （真实事故：报错文案里的示例被照抄成上一题的答案）。
+   */
+  | { kind: 'fold' }
+  /**
+   * 转到视角（**仅立体题**）：
+   *   face      —— 转到正对某个面（讲"看底面 ABCD"时用）
+   *   azimuth/elevation —— 直接指一个视角（两人都省略就退化成原位停一下）
+   *
+   * 不转的话，讲"从上面看"只能对着斜视角干说，学生没法把话和图对上。
+   */
+  | { kind: 'view'; face?: string; azimuth?: number; elevation?: number };
 
 /** 每种动作的默认演出时长（毫秒）。写在这里而不是散在各处，方便统一调节奏 */
 export const ACTION_MS: Record<Action['kind'], number> = {
@@ -74,6 +90,10 @@ export const ACTION_MS: Record<Action['kind'], number> = {
   emphasize: 320,
   param: 1600,
   board: 300,
+  // 折起要"看得见过程"：太快像跳帧，太慢会拖住讲解
+  fold: 1900,
+  // 转向是纯运镜，1.2 秒刚好——再快会晕，再慢会让人觉得卡住了
+  view: 1200,
 };
 
 /** 同一句里多个动作之间的错峰间隔：像老师边说边画，不是一起蹦出来 */
@@ -185,9 +205,28 @@ export function actionLabel(action: Action): string {
       return `调 ${action.name}`;
     case 'board':
       return '';
+    case 'fold':
+      return '折起';
+    case 'view':
+      return action.face ? `转到看 ${action.face}` : '换视角';
     default:
       return '';
   }
+}
+
+/**
+ * 立体题的动作提示条：只有"折起 / 转到视角"两种值得写出来。
+ *
+ * 3D 里 draw / angle / length 这些平面几何动作画不出来（它们算的是二维坐标），
+ * 所以提示条不能像 2D 那样拿第一个动作凑——会出现"标 ∠BAC"写在画面上、
+ * 图上却什么都没有。宁可不提示，也不能报假动作。
+ */
+export function motionLabel(actions: Action[]): string {
+  for (const a of actions) {
+    if (a.kind === 'fold') return '折起';
+    if (a.kind === 'view') return a.face ? `转到看 ${a.face}` : '换视角';
+  }
+  return '';
 }
 
 /** 一组动作里最值得显示在提示条上的那一条（优先"手上动作"，其次强调） */

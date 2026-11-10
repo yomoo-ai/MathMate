@@ -27,6 +27,7 @@
  */
 import type { Scene, StepDef } from '../protocol/scene';
 import type { Scene3D } from '../protocol/scene3d';
+import { isScene3D } from '../protocol/scene3d';
 import type { Action } from '../core/action';
 import { callChat } from './stub';
 import { clipBoardLine } from '../ui/mathText';
@@ -88,7 +89,7 @@ export interface Narration {
 // 提示词
 // ---------------------------------------------------------------
 
-function systemPrompt(): string {
+function systemPrompt(opts: { is3d: boolean; hasFold: boolean }): string {
   return `你是一位中学数学老师，正在录一段"边讲边画"的解题视频。请把给出的解题步骤改写成**动作脚本**。
 
 【核心要求】
@@ -149,7 +150,20 @@ function systemPrompt(): string {
    **只能推对象清单里登记过的参数**。题目是"分类讨论 / 参数范围"时，
    按分类分段推：先推到边界一侧，讲完再推到另一侧。
 9. {"kind":"board","text":"$BD = \\\\frac{1}{2}AB$","accent":true}
-   —— 往黑板加一行推导。通常用 beat.board 数组更省事。
+   —— 往黑板加一行推导。通常用 beat.board 数组更省事。${opts.is3d ? `
+10. {"kind":"view","face":"fBottom"}
+   —— 把镜头转到正对某个面（只在"看底面 / 从上面看 / 看侧面"这类句子用）。
+   也可以直接指视角：{"kind":"view","azimuth":35,"elevation":60}。
+   整段最多用 2 次——镜头一多，人就晕了，而且每次转都要占掉 1 秒多。${
+   opts.hasFold
+     ? `
+11. {"kind":"fold"}
+   —— 把图**折起来**（本题已声明折痕与折起角，你不用写任何坐标或角度）。
+   在讲到"沿 BD 折起 / 折成 / 翻折"的那一句写，**整段只写一次**。
+   注意：折之前整张图是摊平的，所以折起之后的句子才按立体图形讲；
+   如果原文从头到尾没提折起，就不要写这个动作。`
+     : ''
+ }` : ''}
 
 【硬性规则】
 1. **绝不改变数学内容**：不许改数字、不许换推理路线、不许加题面没有的条件、不许跳步。
@@ -194,6 +208,28 @@ function describeScene(scene: AnyScene): string {
 
   const board = (scene as Scene).visual === 'board';
 
+  const is3d = isScene3D(scene);
+  const fold = is3d ? (scene as Scene3D).fold : undefined;
+  const faceIds = is3d
+    ? scene.objects.filter((o) => o.type === 'face3').map((o) => o.id)
+    : [];
+
+  const foldBlock = fold
+    ? `
+
+【本题有翻折（视频会把"折起来"这个过程演出来）】
+折痕是 ${fold.crease[0]}${fold.crease[1]}，跟着折起来的是 ${fold.moving.join('、')} 这一块，
+折起角 ${fold.deg}°。讲到折起那一步写 {"kind":"fold"}（整段只写一次）。
+折起之前图是摊平的，所以在那之前的句子不要把它当立体图形讲。`
+    : '';
+
+  const facesBlock = is3d
+    ? `
+
+【可以"转过去看"的面（view 动作的 face 只能填这些）】
+${faceIds.length ? faceIds.join('、') : '（本题没有声明面）'}`
+    : '';
+
   return `【本题有没有图形】
 ${board ? '没有图形（visual=board）：这是一道只能靠推导讲的题，actions 必须全部为空数组，只写 say 和 board。' : '有图形：动作只能引用下面清单里的 id。'}
 
@@ -204,7 +240,7 @@ ${lines.length ? lines.join('、') : '（无）'}
 ${params || '（无）'}
 
 【题目已登记的几何条件（标角度/长度时以这里为准）】
-${facts.length ? facts.join('；') : '（本题没有登记几何条件，动作只做 emphasize / draw / param / board）'}`;
+${facts.length ? facts.join('；') : '（本题没有登记几何条件，动作只做 emphasize / draw / param / board）'}${foldBlock}${facesBlock}`;
 }
 
 function userPrompt(problem: string, steps: AnyScene['steps'], scene: AnyScene): string {
@@ -253,6 +289,8 @@ function parseAction(
   raw: unknown,
   valid: Set<string>,
   params: Set<string>,
+  /** 立体题专有的两类动作要知道上下文：有没有声明翻折、有哪些面 */
+  extra: { is3d: boolean; hasFold: boolean; faces: Set<string> },
   diag?: { why?: string },
 ): Action | null {
   /** 丢掉动作时把原因写进 diag：视频角上要能说清"为什么没画出来" */
@@ -372,6 +410,29 @@ function parseAction(
       return { kind: 'board', text: clipBoardLine(text), accent: a.accent === true };
     }
 
+    case 'fold': {
+      // 折痕、折起角都由场景声明，动作只管"什么时候折"——
+      // 所以这里不读任何字段，只检查这一场到底有没有可折的东西
+      if (!extra.hasFold) return fail('本题没有声明翻折（scene.fold），不要写 fold 动作');
+      return { kind: 'fold' };
+    }
+
+    case 'view': {
+      if (!extra.is3d) return fail('view（转视角）只能用在立体题上');
+      const face = str('face');
+      if (face && !extra.faces.has(face)) return fail(`图里没有面 ${face}`);
+      const azimuth = typeof a.azimuth === 'number' && isFinite(a.azimuth) ? a.azimuth : undefined;
+      const elevation = typeof a.elevation === 'number' && isFinite(a.elevation) ? a.elevation : undefined;
+      if (!face && azimuth === undefined && elevation === undefined) {
+        return fail('view 动作要么给 face（转到正对某个面），要么给 azimuth / elevation');
+      }
+      const out: Action = { kind: 'view' };
+      if (face) out.face = face;
+      if (azimuth !== undefined) out.azimuth = azimuth;
+      if (elevation !== undefined) out.elevation = elevation;
+      return out;
+    }
+
     default:
       return fail(`不认识的动作类型 ${String(kind)}`);
   }
@@ -411,6 +472,17 @@ function normalize(raw: unknown, scene: AnyScene): Narration | null {
   // 可扫的参数：param 动作只能推场景里登记过的滑杆
   const paramNames = new Set<string>((scene.params ?? []).map((p) => p.name));
 
+  // 立体题才有的两种动作（折起 / 转视角）要知道：这一场是不是 3D、
+  // 有没有声明翻折、有哪些面可以"转过去看"
+  const is3d = isScene3D(scene);
+  const extra = {
+    is3d,
+    hasFold: is3d && !!(scene as Scene3D).fold,
+    faces: new Set<string>(
+      is3d ? scene.objects.filter((o) => o.type === 'face3').map((o) => o.id) : [],
+    ),
+  };
+
   const knowns = Array.isArray(data.knowns)
     ? data.knowns
         .filter((k): k is string => typeof k === 'string' && k.trim() !== '')
@@ -439,7 +511,7 @@ function normalize(raw: unknown, scene: AnyScene): Narration | null {
       if (Array.isArray(bb.actions)) {
         for (const ra of bb.actions) {
           const diag: { why?: string } = {};
-          const act = parseAction(ra, valid, paramNames, diag);
+          const act = parseAction(ra, valid, paramNames, extra, diag);
           if (act) actions.push(act);
           else {
             const rawKind = (ra as { kind?: unknown })?.kind;
@@ -575,11 +647,22 @@ function splitStep(step: StepDef): Beat[] {
 /** 降级方案：不调模型，直接把每一步按句切开 + 抽板书 */
 export function fallbackNarration(scene: AnyScene): Narration {
   const steps = scene.steps ?? [];
-  return {
-    knowns: [],
-    steps: steps.map((s) => ({ title: s.title, beats: splitStep(s as StepDef) })),
-    fromModel: false,
-  };
+  const out: NarrationStep[] = steps.map((s) => ({ title: s.title, beats: splitStep(s as StepDef) }));
+
+  // 立体题声明了翻折，就给降级脚本补一个 fold 动作——挂在"第一次提到折起"的那一步。
+  //
+  // 为什么降级也要补：翻折是这道题的**核心画面**（"沿 BD 折起"整句话就是这个动作），
+  // 没有 API Key 时如果连折都不折，用户看到的就是一张静态图配一句"沿 BD 折起"，
+  // 会以为功能坏了。规则简单到不会错：第一个正文里出现"折"的步骤，第一句开折。
+  const fold = isScene3D(scene) ? (scene as Scene3D).fold : undefined;
+  if (fold && out.length > 0) {
+    let at = steps.findIndex((s) => /折/.test(`${s.title}${s.text}`));
+    if (at < 0) at = 0;
+    const target = out[at]?.beats[0];
+    if (target) target.actions = [{ kind: 'fold' }, ...target.actions];
+  }
+
+  return { knowns: [], steps: out, fromModel: false };
 }
 
 // ---------------------------------------------------------------
@@ -612,8 +695,9 @@ export async function buildNarration(opts: {
 
   try {
     onProgress?.('正在拆解讲解动作……');
+    const is3d = isScene3D(scene);
     const text = await callChat([
-      { role: 'system', content: systemPrompt() },
+      { role: 'system', content: systemPrompt({ is3d, hasFold: is3d && !!(scene as Scene3D).fold }) },
       { role: 'user', content: userPrompt(problem, steps, scene) },
     ]);
     const parsed = normalize(extractJson(text), scene);
