@@ -210,6 +210,26 @@ main {
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
+  /* 抽屉是舞台的兄弟节点：展开时画布让出宽度，图重排取景而不是被盖住 */
+  display: flex;
+  align-items: stretch;
+}
+
+/* 画布列：纵向放「舞台 + 答疑抽屉」，两者不互相遮挡 */
+#stage-col {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 画布舞台：渲染器量这一层的宽高来定画布尺寸 */
+#stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 
 #canvas-container canvas {
@@ -1751,4 +1771,461 @@ body.vs-fs-lock {
   color: inherit;
   opacity: 0.8;
   word-break: break-all;
+}
+
+/* =============================================================
+   本题知识点抽屉（贴画布右侧，展开时画布让出宽度）
+   ============================================================= */
+.kp-drawer {
+  position: relative;
+  flex: none;
+  width: 0;
+  transition: width 0.22s ease;
+  background: var(--panel);
+  z-index: 6;
+}
+.kp-drawer[data-open='true'] {
+  width: 322px;
+  border-left: 1px solid var(--border);
+  box-shadow: -6px 0 18px rgba(16, 24, 40, 0.04);
+}
+.kp-drawer[data-open='false'] .kp-panel {
+  opacity: 0;
+  pointer-events: none;
+}
+.kp-panel {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: opacity 0.16s ease;
+}
+
+/* 竖标签：收起时贴在画布右边缘，只露这一条 */
+.kp-tab {
+  position: absolute;
+  left: -26px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 26px;
+  padding: 12px 0;
+  writing-mode: vertical-rl;
+  letter-spacing: 2px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  border-right: none;
+  border-radius: var(--r-md) 0 0 var(--r-md);
+  cursor: pointer;
+  z-index: 7;
+}
+.kp-tab:hover {
+  background: #fde3cd;
+}
+.kp-drawer[data-open='true'] .kp-tab {
+  background: var(--panel);
+  border-color: var(--border);
+  color: var(--text-2);
+}
+
+.kp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 12px 9px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.kp-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.kp-count {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.kp-icon {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--r-sm);
+}
+.kp-icon:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.kp-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.kp-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 9px 10px 10px;
+  background: #fff;
+}
+.kp-card-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.kp-idx {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.kp-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.4;
+}
+.kp-formula {
+  margin-top: 7px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  overflow-x: auto;
+}
+.kp-use,
+.kp-pit {
+  margin-top: 6px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+.kp-use b,
+.kp-pit b {
+  display: inline-block;
+  margin-right: 5px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-3);
+  background: var(--panel-2);
+}
+.kp-pit b {
+  color: var(--warn);
+  background: #fdf3e7;
+}
+.kp-hint {
+  margin: 6px 0;
+  font-size: 12.5px;
+  color: var(--text-3);
+  line-height: 1.7;
+}
+.kp-skeleton {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kp-skeleton i {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #f2f4f8 25%, #e9edf5 37%, #f2f4f8 63%);
+  background-size: 400% 100%;
+  animation: kp-shimmer 1.3s ease infinite;
+}
+.kp-skeleton i:nth-child(1) {
+  width: 42%;
+  height: 10px;
+}
+.kp-skeleton i:nth-child(3) {
+  width: 76%;
+}
+@keyframes kp-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+.kp-foot {
+  flex: none;
+  border-top: 1px solid var(--border);
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.kp-note {
+  line-height: 1.5;
+}
+.kp-foot .btn {
+  margin-left: auto;
+  padding: 4px 9px;
+  font-size: 11.5px;
+  flex: none;
+}
+
+/* =============================================================
+   答疑面板（右下角气泡 + 底部抽屉）
+   ============================================================= */
+.chat-bubble {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 15px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: linear-gradient(180deg, #f97316, #ea580c);
+  color: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(234, 88, 12, 0.28);
+}
+.chat-bubble:hover {
+  transform: translateY(-1px);
+}
+.chat-bubble[hidden] {
+  display: none;
+}
+.chat-bubble-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #fff;
+  opacity: 0.9;
+}
+
+/* 收起 = 高度 0，舞台自动占满；展开 = 让出 44% 高度给对话。
+   这样图会重新取景，而不是被面板压住下半截（立体图的底面顶点常在下方） */
+.chat-panel {
+  position: relative;
+  flex: none;
+  height: 0;
+  overflow: hidden;
+  background: #fff;
+  z-index: 9;
+  transition: height 0.2s ease;
+}
+.chat-panel[data-open='true'] {
+  height: 44%;
+  min-height: 210px;
+  max-height: 72%;
+  border-top: 1px solid var(--border-strong);
+  box-shadow: 0 -8px 24px rgba(16, 24, 40, 0.06);
+}
+.chat-inner {
+  position: absolute;
+  inset: 0;
+  min-height: 210px;
+  display: flex;
+  flex-direction: column;
+}
+.chat-grip {
+  height: 10px;
+  margin: 0 auto;
+  width: 54px;
+  cursor: ns-resize;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-grip::before {
+  content: '';
+  width: 40px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px 8px;
+  flex: none;
+}
+.chat-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.chat-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.chat-link {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.chat-link:hover {
+  color: var(--accent);
+}
+
+.chat-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 14px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.chat-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.chat-row.user {
+  justify-content: flex-end;
+}
+.chat-avatar {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-wrap {
+  min-width: 0;
+  max-width: 86%;
+}
+.chat-msg {
+  font-size: 13px;
+  line-height: 1.68;
+  border-radius: 10px;
+  padding: 7px 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-msg.bot {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.chat-msg.user {
+  background: var(--accent-soft);
+  color: #7c2d12;
+  border: 1px solid #fbd9bd;
+  max-width: 82%;
+}
+.chat-msg.error {
+  background: #fef3f2;
+  border-color: #fecdca;
+  color: var(--danger);
+}
+.chat-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+.chat-act-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #ecfdf3;
+  color: var(--ok);
+  border: 1px solid #abefc6;
+}
+.chat-hint {
+  margin: 2px 0 6px;
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.7;
+}
+.chat-quick {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 14px 8px;
+}
+.chat-quick-chip {
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: #fff;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.chat-quick-chip:hover {
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+.chat-input-row {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  padding: 0 14px 12px;
+}
+.chat-input {
+  flex: 1;
+  min-height: 36px;
+  max-height: 96px;
+  resize: none;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: #fff;
+  color: var(--text);
+}
+.chat-input:focus {
+  outline: none;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.14);
+}
+.chat-send {
+  flex: none;
+  height: 36px;
+}
+
+.chat-act-chip.done {
+  opacity: 0.5;
+  cursor: default;
 }

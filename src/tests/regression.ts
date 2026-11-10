@@ -27,6 +27,10 @@ import { foldAngleFrom, foldPositions, planFold } from '../protocol/fold3d';
 import { compileTimeline, sampleBeat } from '../ui/timeline';
 import type { Narration } from '../llm/narration';
 import { resolveScene3D } from '../protocol/resolve3d';
+import { sanitizeAction, stripActStream } from '../llm/actProtocol';
+import { splitReply } from '../llm/chatAgent';
+import { normalizeKnowledge, fallbackKnowledge } from '../llm/knowledge';
+import { buildFactSheet } from '../llm/factSheet';
 import { evalVec3 } from '../protocol/expr';
 import type { Point3Object, Scene3D, Scene3DObject, Vec3 } from '../protocol/scene3d';
 import { CASES, CASES_3D, RENDER_CASES, type TestCase, type TestCase3D } from './cases';
@@ -210,6 +214,7 @@ export function runAll(): Report {
     ...runFoldCases3D(),
     ...runFoldDeriveCases3D(),
     ...runJsonRepairCases(),
+    ...runLearningCases(),
     ...runRenderCases(),
   ];
   const skipped = rows.filter((r) => r.skipped).length;
@@ -861,6 +866,220 @@ function runJsonRepairCases(): RowResult[] {
         '修复器只能动语法层。把正文里的字符改掉比报错更糟——错得没人发现',
         r.ok && title === '注意,} 这种字符',
         r.ok ? `title=${title}` : `失败：${r.why}`,
+      ),
+    );
+  }
+
+  return rows;
+}
+
+/* ===============================================================
+ * 学习面板关：聊天联动白名单 + 知识点清洗 + 事实底稿
+ *
+ * 这一组全是纯函数，不碰 DOM。它们的共同风险是"模型说什么就执行什么"：
+ * 联动指令不过白名单，聊天就能把图跳到不存在的步骤、高亮不存在的棱；
+ * 知识点不清洗，抽屉里就会出现 9 条、每条 200 字的"公式大全"。
+ * =============================================================== */
+function runLearningCases(): RowResult[] {
+  const mk = (name: string, why: string, ok: boolean, actual?: string): RowResult => ({
+    name,
+    why,
+    gate: '学习面板关',
+    ok,
+    detail: ok ? '全部通过' : '断言不成立',
+    actualText: actual,
+  });
+
+  const rows: RowResult[] = [];
+  const ids = new Set(['A', 'B', 'C', 'BE', 'A1O']);
+
+  // ① 合法指令原样通过
+  {
+    const act = sanitizeAction({ jump: 2, focus: ['BE', 'A1O'] }, 4, ids);
+    const ok = act?.jump === 2 && act.focus?.length === 2;
+    rows.push(
+      mk(
+        '联动：合法的跳步 + 高亮能通过白名单',
+        '这是聊天唯一能动图的两件事，先确保正常指令不被误杀',
+        ok,
+        JSON.stringify(act),
+      ),
+    );
+  }
+
+  // ② 越界跳步一律丢弃
+  {
+    const a0 = sanitizeAction({ jump: 0 }, 4, ids);
+    const a9 = sanitizeAction({ jump: 9 }, 4, ids);
+    const ok = a0 === null && a9 === null;
+    rows.push(
+      mk(
+        '联动：跳步越界（0 / 9）被丢弃',
+        '跳到不存在的步骤会让步骤条与图脱节，比不跳更糟',
+        ok,
+        `${JSON.stringify(a0)} / ${JSON.stringify(a9)}`,
+      ),
+    );
+  }
+
+  // ③ 不存在的 id 被过滤，且最多 3 个
+  {
+    const act = sanitizeAction(
+      { focus: ['BE', '不存在的棱', 'A', 'B', 'C', 'A1O'] },
+      4,
+      ids,
+    );
+    const ok = JSON.stringify(act?.focus) === JSON.stringify(['BE', 'A', 'B']);
+    rows.push(
+      mk(
+        '联动：不存在的 id 被过滤，且最多高亮 3 个',
+        '模型会照着文字里的点名字写 id，图上没有就该忽略，而不是去猜',
+        ok,
+        JSON.stringify(act),
+      ),
+    );
+  }
+
+  // ④ 全非法 → null（宁可不动作，不能乱动）
+  {
+    const act = sanitizeAction({ jump: 99, focus: ['X'] }, 2, ids);
+    rows.push(
+      mk(
+        '联动：全部不合法时返回 null',
+        '指令写坏时要"当作没写"，回答照常显示、画面不动',
+        act === null,
+        JSON.stringify(act),
+      ),
+    );
+  }
+
+  // ⑤ 流式阶段的半截标记要切掉
+  {
+    const { text } = stripActStream('因为 AO⊥BE，所以折后依然垂直。\n<<act {"jump":2,"fo');
+    const ok = text === '因为 AO⊥BE，所以折后依然垂直。';
+    rows.push(
+      mk(
+        '联动：流式期间的半截指令标记不可见',
+        '不切掉的话，用户会看着半截 JSON 在回答末尾闪一下',
+        ok,
+        JSON.stringify(text),
+      ),
+    );
+  }
+
+  // ⑥ 收尾拆出正文与指令
+  {
+    const r = splitReply('取 BE 中点是因为三线合一。\n<<act {"jump":2,"focus":["BE"]}>>');
+    const ok =
+      r.text === '取 BE 中点是因为三线合一。' &&
+      r.action?.jump === 2 &&
+      r.action?.focus?.[0] === 'BE';
+    rows.push(
+      mk(
+        '联动：收尾把正文与指令拆开',
+        '正文里不能残留标记，指令也不能丢——两个错一个都会让联动失效',
+        ok,
+        JSON.stringify(r),
+      ),
+    );
+  }
+
+  // ⑦ 知识点清洗：条数上限、同名去重、超长截断、多余的 step 不进结果
+  {
+    const raw = JSON.stringify({
+      points: [
+        { name: '线面垂直的判定', formula: '$a\\perp b$', step: 2 },
+        { name: '线面垂直的判定', formula: '重复项', step: 2 },
+        ...Array.from({ length: 8 }, (_, i) => ({
+          name: `知识点${i}`,
+          use: 'x'.repeat(200),
+          step: 99,
+        })),
+      ],
+    });
+    const pts = normalizeKnowledge(raw);
+    const ok =
+      pts.length === 6 &&
+      pts.filter((p) => p.name.includes('线面垂直')).length === 1 &&
+      !('step' in pts[0]) &&
+      pts.every((p) => p.use.length <= 80);
+    rows.push(
+      mk(
+        '知识点：条数/同名/超长被清洗，step 字段不进结果',
+        '模型一次能给 9 条、每条 200 字，直接渲染会把抽屉撑成一片文字墙',
+        ok,
+        `${pts.length} 条，首条 ${JSON.stringify(pts[0])}`,
+      ),
+    );
+  }
+
+  // ⑧ 裸 LaTeX 公式自动补 $
+  {
+    const pts = normalizeKnowledge(
+      JSON.stringify([{ name: '二面角', formula: 'AO\\perp BE' }]),
+    );
+    const ok = pts[0]?.formula === '$AO\\perp BE$';
+    rows.push(
+      mk(
+        '知识点：裸 LaTeX 公式自动包 $',
+        '不包 $ 的话 renderMathText 会当普通文字排，学生看到的是一串反斜杠',
+        ok,
+        JSON.stringify(pts[0]?.formula),
+      ),
+    );
+  }
+
+  // ⑨ 兜底名词：从约束与翻折反推
+  {
+    const scene: Scene3D = {
+      space: '3d' as const,
+      meta: { title: '折叠题' },
+      params: [],
+      objects: [],
+      constraints: [
+        { type: 'perp-lines' as const, a: ['A1', 'O'], b: ['B', 'E'] },
+        { type: 'equal-length' as const, a: ['B', 'C'], b: ['C', 'D'] },
+      ],
+      fold: { crease: ['B', 'E'] as [string, string], moving: ['A1'], deg: 90 },
+    } as Scene3D;
+    const names = fallbackKnowledge(scene).map((p) => p.name);
+    const ok = names.includes('线线垂直') && names.includes('等长与全等') && names.includes('翻折与二面角');
+    rows.push(
+      mk(
+        '知识点：模型失败时按约束反推名词',
+        '抽屉永远不能是空的——没有模型时至少告诉学生"这题在考什么"',
+        ok,
+        names.join('、'),
+      ),
+    );
+  }
+
+  // ⑩ 事实底稿：坐标可算、隐藏点不出现
+  {
+    const scene: Scene3D = {
+      space: '3d' as const,
+      meta: { title: '正方体' },
+      params: [],
+      objects: [
+        { id: 'A', type: 'point3' as const, at: [0, 0, 0] },
+        { id: 'B', type: 'point3' as const, at: [2, 0, 0] },
+        { id: 'C', type: 'point3' as const, at: [2, 2, 0] },
+        { id: 'Ah', type: 'point3' as const, at: [0, 2, 0], hidden: true },
+        { id: 'AB', type: 'edge3' as const, a: 'A', b: 'B' },
+      ],
+      constraints: [{ type: 'perp-lines' as const, a: ['A', 'B'], b: ['A', 'C'] }],
+    } as Scene3D;
+    const facts = buildFactSheet(scene, {});
+    const ok =
+      facts.text.includes('A(0, 0, 0)') &&
+      !facts.text.includes('Ah') &&
+      facts.text.includes('AB ⊥ AC');
+    rows.push(
+      mk(
+        '事实底稿：3D 顶点坐标、约束与隐藏点',
+        '答疑全靠这份底稿压住"另算一套坐标"的冲动；隐藏的折前点混进来会更乱',
+        ok,
+        facts.text.replace(/\n/g, ' | ').slice(0, 160),
       ),
     );
   }

@@ -28,6 +28,11 @@ import { isBoardScene, guardVisual } from './core/visualMode';
 import { renderMathText } from './ui/mathText';
 import { SAMPLE_SCENE_JSON } from './protocol/samples';
 import { requestSceneFromPrompt, requestSceneFromPrompt3D, transcribeImage } from './llm/stub';
+import { buildFactSheet } from './llm/factSheet';
+import type { ChatContext } from './llm/chatAgent';
+import type { ChatAction } from './llm/actProtocol';
+import { mountKnowledgePanel } from './ui/knowledgePanel';
+import { mountChatPanel } from './ui/chatPanel';
 import {
   mountNotebook,
   loadEntries,
@@ -67,10 +72,15 @@ function verifyAny(scene: AnyScene): Issue[] {
 }
 
 const canvasContainer = $('canvas-container');
+/** 画布舞台：渲染器量这一层的尺寸；知识抽屉是它的兄弟节点 */
+const stageEl = $('stage');
 const tabsEl = $<HTMLSelectElement>('scene-tabs'); // 演示场景下拉框
 const infoEl = $('scene-info');
 const paramsEl = $('params');
 const readoutsEl = $('readouts');
+/** 题目原文：LLM 输入框里放的就是它（拍照识题转录后也回填到这里）。
+ *  声明必须早于首次 applyScene——初始化时它就要被读（知识点/答疑都用）。 */
+const llmPromptInput = $<HTMLTextAreaElement>('llm-prompt');
 /** 「实时数值」这个小标题在立体场景里要换成「操作提示」 */
 const readoutsTitleEl = readoutsEl.previousElementSibling as HTMLElement | null;
 const jsonInput = $<HTMLTextAreaElement>('json-input');
@@ -116,12 +126,12 @@ function pushLog(m: string) {
 
 jsonInput.value = SAMPLE_SCENE_JSON;
 
-const renderer = new SceneRenderer(canvasContainer);
+const renderer = new SceneRenderer(stageEl);
 // 主画布关闭步骤运镜：点"上一步/下一步"时视野固定不动（坐标轴不晃、不自动缩放），
 // 缩放只由参数滑杆控制；讲解视频板块的渲染器不受影响，仍保留运镜。
 renderer.stepFlyEnabled = false;
 // 给 2D 画布打标记：切到立体场景时靠它把两块画布互相隐藏
-const canvas2d = canvasContainer.querySelector('canvas') as HTMLCanvasElement | null;
+const canvas2d = stageEl.querySelector('canvas') as HTMLCanvasElement | null;
 canvas2d?.setAttribute('data-space', '2d');
 
 /** 3D 渲染器按需创建——不用立体场景就不占一个 WebGL 上下文 */
@@ -267,7 +277,7 @@ deriveBackBtn?.addEventListener('click', backToDerive);
 
 function ensureRenderer3d(): Scene3DRenderer {
   if (!renderer3d) {
-    renderer3d = new Scene3DRenderer(canvasContainer);
+    renderer3d = new Scene3DRenderer(stageEl);
     // 同 2D：主画布切步骤不运镜，视野保持固定
     renderer3d.stepFlyEnabled = false;
   }
@@ -309,6 +319,7 @@ function applyScene(
     jsonError.textContent = '';
     refreshReadouts3D(scene);
     setupSteps(scene.steps);
+    syncLearningPanels(scene);
     return;
   }
 
@@ -329,6 +340,7 @@ function applyScene(
   refreshReadouts();
   if (board) renderDeriveBoard(scene.steps ?? [], notice);
   setupSteps(scene.steps);
+  syncLearningPanels(scene);
 }
 
 /** 诊断页专用：跳过 hash 逻辑直接应用任意场景（不用于正常入口） */
@@ -417,6 +429,91 @@ $('step-video').addEventListener('click', () => {
     videoStudio.open(activeScene, params, title, problem);
   }
 });
+
+// ---------------------------------------------------------------
+// 知识点抽屉 + 答疑面板（都贴在图旁边，不占右侧功能栏）
+// ---------------------------------------------------------------
+/** 当前题面：LLM 输入框里的原文（内置演示场景为空） */
+function currentProblem(): string {
+  return llmPromptInput.value.trim();
+}
+
+/** 当前生效的场景：立体优先，否则平面 */
+function activeSceneAny(): AnyScene {
+  return activeSpace === '3d' && activeScene3D ? activeScene3D : activeScene;
+}
+
+const knowledgePanel = mountKnowledgePanel(canvasContainer, {
+  onLayoutChange: () => {
+    // 抽屉展开/收起是 0.22s 的过渡：等它落定再让渲染器量一次容器宽度，
+    // 量早了会按半宽取景，动画结束后图看着偏在一边
+    window.setTimeout(() => window.dispatchEvent(new Event('resize')), 240);
+  },
+});
+
+/**
+ * 答疑上下文：每次提问现取，不缓存。
+ * 学生常常先翻到第 3 步再问"这一步为什么"，用旧步号就答偏了。
+ */
+function chatContext(): ChatContext {
+  const scene = activeSceneAny();
+  const facts = buildFactSheet(scene, params);
+  return {
+    problem: currentProblem(),
+    facts: facts.text,
+    steps: currentSteps.map((s) => ({ title: s.title, text: s.text })),
+    stepIndex,
+    ids: facts.ids,
+  };
+}
+
+const chatPanel = mountChatPanel({
+  mount: $('stage-col'),
+  bubbleHost: stageEl,
+  getContext: chatContext,
+  onAction: applyChatAction,
+});
+
+/**
+ * 执行聊天要的画面联动。
+ *
+ * 只有两种动作，且都已经过 actProtocol 的白名单（跳步范围、id 是否存在）。
+ * 这里再兜一层：推导模式没有画布，高亮直接不执行。
+ */
+function applyChatAction(act: ChatAction, undo: boolean) {
+  if (act.jump) {
+    stepIndex = Math.max(0, Math.min(act.jump - 1, currentSteps.length - 1));
+    showStep();
+  }
+  if (!act.focus?.length && !undo) return;
+  if (deriveMode) return;
+  if (undo) {
+    // 撤销高亮 = 回到"这一步本来该有的重点"
+    if (activeSpace === '3d') renderer3d?.clearFocus();
+    else renderer.clearFocus();
+    return;
+  }
+  const focus = act.focus ?? [];
+  if (activeSpace === '3d') renderer3d?.applyFocus(focus, [], []);
+  else renderer.applyFocus(focus, [], []);
+}
+
+// 开发期调试钩子：没有模型时也能验证"跳步 + 高亮"这条链路（build 后自动消失）
+const devEnv = (import.meta as unknown as { env?: { DEV?: boolean } }).env;
+if (devEnv?.DEV) {
+  (window as unknown as Record<string, unknown>).__mmChatAction = applyChatAction;
+}
+
+/** 换场景时同步两块面板：知识点重算，对话清空（题换了，上下文也就失效了） */
+function syncLearningPanels(scene: AnyScene) {
+  knowledgePanel.setScene({
+    problem: currentProblem(),
+    scene,
+    steps: currentSteps.map((s) => ({ title: s.title })),
+    params,
+  });
+  chatPanel.reset();
+}
 
 function loadEntry(entry: SceneEntry) {
   currentEntry = entry;
@@ -654,7 +751,6 @@ refreshNotebook(loadEntries());
 // LLM 场景生成：一句话 → 模型 → 校验 → 渲染
 // ---------------------------------------------------------------
 const llmKeyInput = $<HTMLInputElement>('llm-key');
-const llmPromptInput = $<HTMLTextAreaElement>('llm-prompt');
 /** 「立体几何」开关：勾上后走 3D 的说明书 / 解析器 / 体检器 */
 const solidModeInput = $<HTMLInputElement>('solid-mode');
 

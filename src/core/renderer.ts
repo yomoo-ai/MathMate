@@ -149,6 +149,9 @@ export class SceneRenderer {
   private dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
   private hitPoint = new THREE.Vector3();
 
+  /** 容器尺寸变化的尾延迟防抖句柄（0 = 没有待处理的） */
+  private resizeTimer = 0;
+
   /** 参数被拖拽改变时回调，供 UI（滑杆、数值）同步 */
   onParamChange?: (name: string, value: number) => void;
 
@@ -172,6 +175,20 @@ export class SceneRenderer {
     el.addEventListener('pointerup', () => this.endDrag());
     el.addEventListener('pointercancel', () => this.endDrag());
     window.addEventListener('resize', () => this.onResize());
+    // 容器自身也会变宽变窄（右侧知识点抽屉展开时舞台让步）。
+    // 只监听 window 的话，那种情况下画布尺寸不更新，图会被压扁或裁掉一角。
+    // 用尾延迟防抖：抽屉有 0.22s 的过渡动画，每帧重建一次太浪费——
+    // 等宽度稳定下来再量一次就够。
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => {
+        if (this.resizeTimer) clearTimeout(this.resizeTimer);
+        this.resizeTimer = window.setTimeout(() => {
+          this.resizeTimer = 0;
+          this.onResize();
+        }, 90);
+      });
+      ro.observe(container);
+    }
 
     this.onResize();
   }

@@ -657,6 +657,99 @@ export async function callChat(
   return content;
 }
 
+/**
+ * 流式对话（聊天面板专用）：边收边显示，返回完整文本。
+ *
+ * 与 callChat 的三处区别，都是聊天场景逼出来的：
+ *   1. **不强制 JSON 模式**——聊天要的是人话，套 JSON 只会让它写成
+ *      {"answer":"..."} 这种一层壳；
+ *   2. **温度高一点**（0.5）——讲解需要一点措辞变化，不像生成场景
+ *      那样要逐字确定性；
+ *   3. **走 SSE 逐块回调**——第一句 0.5 秒就能出现，不必等整段。
+ *
+ * 注意这里**没有**走 fetchWithRetry：重试会让已经吐了一半的回答从头再来，
+ * 用户看到的是同一句话打两遍。失败就直接报错，让用户点重试。
+ */
+export async function streamChat(
+  messages: Array<{ role: string; content: string }>,
+  onDelta: (text: string) => void,
+  opts?: { temperature?: number; signal?: AbortSignal },
+): Promise<string> {
+  const key = getApiKey();
+  if (!key) {
+    throw new Error('还没有填 API Key——在右侧「DeepSeek API Key」输入框里粘贴。');
+  }
+  if (!key.startsWith('sk-')) {
+    throw new Error('Key 格式不对：DeepSeek 的 key 以 "sk-" 开头，请回 platform.deepseek.com 重新复制。');
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages,
+        temperature: opts?.temperature ?? 0.5,
+        stream: true,
+      }),
+      signal: opts?.signal,
+    });
+  } catch (err) {
+    // 用户主动中断不算错误
+    if ((err as Error)?.name === 'AbortError') return '';
+    throw new Error(`网络请求失败：${(err as Error).message}（检查网络，或代理是否拦了 /llm-api）`);
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    if (res.status === 429) throw new Error(explain429(body, 'DeepSeek').message);
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(
+        `Key 无效或没有权限（${res.status}）。请回 platform.deepseek.com 重新复制（sk- 开头）。`,
+      );
+    }
+    throw new Error(`DeepSeek 返回 ${res.status}：${body.slice(0, 200)}`);
+  }
+  if (!res.body) throw new Error('浏览器没拿到流式响应体，请重试一次。');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let full = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // SSE 一行一个 data:，逐行处理；半包留到下一轮（按行切不会出现半包 JSON）
+    let nl = buf.indexOf('\n');
+    while (nl >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line.startsWith('data:')) {
+        const payload = line.slice(5).trim();
+        if (payload && payload !== '[DONE]') {
+          try {
+            const d = JSON.parse(payload)?.choices?.[0]?.delta?.content;
+            if (typeof d === 'string' && d) {
+              full += d;
+              onDelta(d);
+            }
+          } catch {
+            // 心跳 / 非内容块，忽略
+          }
+        }
+      }
+      nl = buf.indexOf('\n');
+    }
+  }
+  return full;
+}
+
 /** 把问题清单格式化成给模型看 / 给用户看的几行文字 */
 function formatIssues(issues: Issue[]): string {
   return issues

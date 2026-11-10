@@ -24,6 +24,14 @@
       </header>
       <main>
         <div id="canvas-container">
+          <!-- 画布列：上边是画布舞台，下边是答疑抽屉。
+               两者是纵向 flex 兄弟——答疑面板展开时舞台变矮，图跟着重排，
+               不会被面板压住下半截 -->
+          <div id="stage-col">
+          <!-- 画布舞台：渲染器按这一层的尺寸定画布大小。
+               知识抽屉是它的兄弟节点——抽屉展开时舞台变窄，图跟着重排，
+               不会被盖住（立体图右上角常有顶点） -->
+          <div id="stage">
           <!-- 推导模式：没有可对应图形的题（纯代数/不等式/参数范围）不画图，
                改排推导板书。顶部那行小字说明"为什么没有图"，避免被当成故障 -->
           <div id="derive-board" hidden>
@@ -47,6 +55,8 @@
               <span class="nb-hint">只存在这台电脑的浏览器里</span>
               <button class="btn" data-action="clear">清空</button>
             </div>
+          </div>
+          </div>
           </div>
         </div>
         <aside id="panel">
