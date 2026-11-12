@@ -1,6 +1,19 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  // -----------------------------------------------------------
+  // 双入口：index.html 是生成式主应用，courseware.html 是互动课件板块。
+  // 分成两个 HTML 而不是放进同一个 SPA，是为了让课件能单独打包、单独投屏，
+  // 也为了在课件还没稳定时不牵连主应用。
+  // -----------------------------------------------------------
+  build: {
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        courseware: 'courseware.html',
+      },
+    },
+  },
   server: {
     port: 5173,
     host: '127.0.0.1',

@@ -1,0 +1,596 @@
+/* shell.css —— 课件外壳样式
+ *
+ * 美术方向：精密线框 + 浅色玻璃（A+B 混合）
+ *   - 图形本身走线框：线条细、颜色少、可读性优先（投屏后仍然清楚）
+ *   - 容器走玻璃：白 72% 透明 + 背景虚化 + 极淡投影，让画布浮起来
+ *   - 底色不是纯白，而是两团极淡的暖/冷光晕，避免"工程白"
+ *
+ * 投屏要点（这条最容易翻车）：
+ *   投影机会压对比度，所以正文色用 #1b2130 而不是灰，边框不做成浅灰细丝，
+ *   关键数字用 26px 以上，卡片间距留足 12px，暗背景一律不用。
+ */
+
+.cw {
+  --ink: #1b2130;
+  --ink-2: #5c6577;
+  --ink-3: #8b93a7;
+  --line: rgba(27, 33, 48, 0.09);
+  --accent: #ea580c;
+  --teal: #0f766e;
+  --blue: #185fa5;
+  --ok: #0e7a4f;
+  --glass: rgba(255, 255, 255, 0.74);
+  --glass-line: rgba(255, 255, 255, 0.9);
+  --shadow: 0 10px 30px rgba(23, 32, 52, 0.07), 0 1px 2px rgba(23, 32, 52, 0.05);
+
+  box-sizing: border-box;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 24px 16px;
+  color: var(--ink);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei",
+    "Segoe UI", sans-serif;
+  background:
+    radial-gradient(1100px 620px at 8% -10%, #fdf0e4 0%, rgba(253, 240, 228, 0) 62%),
+    radial-gradient(900px 560px at 96% 4%, #e7f2f0 0%, rgba(231, 242, 240, 0) 58%),
+    #f8f5f0;
+}
+.cw *,
+.cw *::before,
+.cw *::after {
+  box-sizing: inherit;
+}
+
+/* ---------------- 顶栏 ---------------- */
+.cw-top {
+  position: relative;
+  padding: 2px 4px 0;
+  flex: 0 0 auto;
+}
+.cw-crumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-3);
+  letter-spacing: 0.02em;
+}
+.cw-subject {
+  color: var(--teal);
+  background: rgba(15, 118, 110, 0.08);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-weight: 500;
+}
+.cw-sep {
+  opacity: 0.4;
+}
+.cw-code {
+  margin-left: 4px;
+  color: var(--ink-3);
+  border-left: 1px solid var(--line);
+  padding-left: 10px;
+}
+.cw-title {
+  margin: 6px 0 2px;
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.cw-sub {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-2);
+  max-width: 760px;
+  line-height: 1.6;
+}
+.cw-top-actions {
+  position: absolute;
+  top: 6px;
+  right: 2px;
+}
+.cw-icon-btn {
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink-2);
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(23, 32, 52, 0.04);
+}
+.cw-icon-btn:hover {
+  color: var(--ink);
+  border-color: rgba(27, 33, 48, 0.16);
+}
+
+/* ---------------- 主体两栏 ---------------- */
+.cw-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 372px;
+  gap: 14px;
+}
+.cw-card {
+  background: var(--glass);
+  backdrop-filter: blur(16px) saturate(1.1);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  border: 1px solid var(--glass-line);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.cw-stage {
+  padding-bottom: 10px;
+}
+.cw-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex: 0 0 auto;
+}
+.cw-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent);
+  background: rgba(234, 88, 12, 0.09);
+  border-radius: 6px;
+  padding: 3px 7px;
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+.cw-head-txt {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.cw-head-txt b {
+  font-size: 14px;
+  font-weight: 500;
+}
+.cw-head-txt i {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.cw-canvas {
+  flex: 1 1 auto;
+  min-height: 0;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: #f7f6f3;
+}
+.cw-canvas canvas {
+  display: block;
+}
+
+/* 主视图下方：问题卡 + 滑杆 */
+.cw-under {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 10px;
+}
+.cw-question {
+  flex: 1 1 auto;
+  font-size: 13px;
+  color: var(--ink);
+  background: rgba(234, 88, 12, 0.06);
+  border: 1px solid rgba(234, 88, 12, 0.18);
+  border-radius: 9px;
+  padding: 8px 12px;
+}
+.cw-question::before {
+  content: "问题 · ";
+  color: var(--accent);
+  font-weight: 500;
+}
+.cw-slider {
+  flex: 0 0 210px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.cw-slider input {
+  flex: 1 1 auto;
+  accent-color: var(--accent);
+}
+
+/* ---------------- 右栏 ---------------- */
+.cw-side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+.cw-grow {
+  flex: 1 1 auto;
+  min-height: 180px;
+}
+
+/* 读数 */
+.cw-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cw-metric {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "k v" "bar bar";
+  gap: 4px 8px;
+  align-items: baseline;
+}
+.cw-metric-k {
+  grid-area: k;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.cw-metric-v {
+  grid-area: v;
+  font-size: 20px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.cw-metric-bar {
+  grid-area: bar;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(27, 33, 48, 0.07);
+  overflow: hidden;
+}
+.cw-metric-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.12s linear;
+}
+
+/* 想一想 */
+.cw-hint {
+  gap: 6px;
+}
+.cw-hint-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.cw-hint-top b {
+  font-size: 13px;
+  font-weight: 500;
+}
+.cw-hint p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--ink-2);
+}
+.cw-btn {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(234, 88, 12, 0.26);
+}
+.cw-btn:hover {
+  filter: brightness(1.05);
+}
+
+/* ---------------- 底部：步骤卡 + 播放器 ---------------- */
+.cw-foot {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cw-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.cw-step {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  font: inherit;
+  color: var(--ink); /* button 不继承父级颜色，深色主题下会掉回浏览器默认深灰 */
+  padding: 9px 12px 9px 10px;
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(23, 32, 52, 0.04);
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+.cw-step:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow);
+}
+.cw-step.on {
+  border-color: rgba(234, 88, 12, 0.45);
+  box-shadow: 0 0 0 2px rgba(234, 88, 12, 0.12), var(--shadow);
+}
+.cw-step-no {
+  position: absolute;
+  top: -7px;
+  left: -6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--teal);
+}
+.cw-step.on .cw-step-no {
+  background: var(--accent);
+}
+.cw-step-thumb {
+  flex: 0 0 60px;
+  height: 40px;
+  border-radius: 7px;
+  background: #f7f6f3;
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.cw-step-thumb svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.cw-step-txt {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cw-step-txt b {
+  font-size: 13px;
+  font-weight: 500;
+}
+.cw-step-txt i {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 播放器 */
+.cw-player {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(23, 32, 52, 0.04);
+}
+.cw-play {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: none;
+  background: var(--ink);
+  color: #fff;
+  font-size: 11px;
+  cursor: pointer;
+}
+.cw-time {
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+.cw-seek {
+  flex: 1 1 auto;
+  accent-color: var(--accent);
+}
+.cw-speeds {
+  display: flex;
+  gap: 2px;
+  background: rgba(27, 33, 48, 0.05);
+  border-radius: 8px;
+  padding: 2px;
+}
+.cw-speeds button {
+  font: inherit;
+  font-size: 11px;
+  color: var(--ink-2);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.cw-speeds button.on {
+  background: #fff;
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(23, 32, 52, 0.08);
+}
+.cw-caption {
+  flex: 0 0 300px;
+  font-size: 12px;
+  color: var(--ink-2);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 提示 */
+.cw-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translate(-50%, 14px);
+  background: var(--ink);
+  color: #fff;
+  font-size: 13px;
+  padding: 9px 16px;
+  border-radius: 10px;
+  opacity: 0;
+  transition: opacity 0.28s, transform 0.28s;
+  pointer-events: none;
+  z-index: 50;
+}
+.cw-toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* ---------------- 顶部课件导航 ---------------- */
+.cw-nav {
+  display: inline-flex;
+  gap: 4px;
+  margin-right: 10px;
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  border-radius: 10px;
+  padding: 3px;
+  box-shadow: 0 1px 2px rgba(23, 32, 52, 0.04);
+}
+.cw-nav-pill {
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink-2);
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cw-nav-pill:hover {
+  color: var(--ink);
+}
+.cw-nav-pill.on {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(234, 88, 12, 0.35);
+}
+
+/* 读数数值的"呼吸灯"：拖动时数字短暂发光，让"数字是活的"被看见 */
+.cw-metric-v {
+  transition: text-shadow 0.35s, color 0.35s;
+}
+.cw-metric-v.flash {
+  color: var(--accent);
+  text-shadow: 0 0 14px rgba(234, 88, 12, 0.55);
+  transition: none;
+}
+
+/* ================================================================
+ * 深色炫酷主题（默认态由 shell.ts 挂 .cw--dark 决定，切"浅色投屏"时移除）
+ * 设计取向：夜蓝画布 + 玻璃浮层 + 暖橙唯一强调色。
+ * 投影机压对比度，所以上课请切浅色档——这里故意不做"深色也保投屏"。
+ * ================================================================ */
+.cw--dark {
+  --ink: #e8ecf6;
+  --ink-2: #a6b0c8;
+  --ink-3: #6f7a96;
+  --line: rgba(232, 236, 246, 0.08);
+  --glass: rgba(17, 24, 42, 0.78);
+  --glass-line: rgba(232, 236, 246, 0.09);
+  --shadow: 0 14px 38px rgba(2, 6, 16, 0.5), 0 1px 2px rgba(2, 6, 16, 0.4);
+
+  background:
+    radial-gradient(1100px 620px at 8% -10%, rgba(234, 88, 12, 0.07) 0%, rgba(234, 88, 12, 0) 62%),
+    radial-gradient(900px 560px at 96% 4%, rgba(29, 78, 130, 0.22) 0%, rgba(29, 78, 130, 0) 58%),
+    #0b101d;
+}
+.cw--dark .cw-canvas {
+  background: #0d1526;
+  border-color: rgba(232, 236, 246, 0.07);
+}
+.cw--dark .cw-question {
+  background: rgba(234, 88, 12, 0.12);
+  border-color: rgba(234, 88, 12, 0.3);
+}
+.cw--dark .cw-metric-bar {
+  background: rgba(232, 236, 246, 0.09);
+}
+.cw--dark .cw-step {
+  background: var(--glass);
+}
+.cw--dark .cw-step.on {
+  border-color: rgba(234, 88, 12, 0.6);
+  box-shadow: 0 0 0 2px rgba(234, 88, 12, 0.18), var(--shadow);
+}
+.cw--dark .cw-step-thumb {
+  background: #0d1526;
+  border-color: rgba(232, 236, 246, 0.08);
+}
+.cw--dark .cw-speeds {
+  background: rgba(232, 236, 246, 0.07);
+}
+.cw--dark .cw-speeds button.on {
+  background: #232e49;
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(2, 6, 16, 0.5);
+}
+.cw--dark .cw-play {
+  background: var(--accent);
+}
+.cw--dark .cw-icon-btn {
+  color: var(--ink-2);
+}
+.cw--dark .cw-icon-btn:hover {
+  color: var(--ink);
+  border-color: rgba(232, 236, 246, 0.2);
+}
+.cw--dark .cw-nav-pill.on {
+  background: var(--accent);
+  color: #fff;
+}
+.cw--dark .cw-toast {
+  background: #232e49;
+}
+
+/* 窄屏（老师用平板时）：右栏折到下面 */
+@media (max-width: 1080px) {
+  .cw {
+    height: auto;
+    min-height: 100vh;
+    padding: 14px;
+  }
+  .cw-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cw-stage {
+    min-height: 46vh;
+  }
+  .cw-caption {
+    display: none;
+  }
+  .cw-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

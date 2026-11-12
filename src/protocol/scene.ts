@@ -72,6 +72,13 @@ interface BaseObject {
   /** CSS 颜色串，如 "#185fa5"；不传则用该类型的默认色 */
   color?: string;
   dashed?: boolean;
+  /**
+   * 光晕：给关键对象叠一圈柔光（点=同色光环，线段=同色宽带）。
+   * 为什么放在 BaseObject 而不是各自类型上？——"要不要强调"是内容决策，
+   * 点和线段的语义一致（"这是主角"），渲染器各自决定怎么画光晕。
+   * 课件里只给 1~3 个核心对象开 glow：满屏光晕 = 没有光晕。
+   */
+  glow?: boolean;
 }
 
 /**
@@ -152,6 +159,14 @@ export interface PolygonObject extends BaseObject {
   points: Vec2Like[];
   /** 是否填充半透明色 */
   fill?: boolean;
+  /**
+   * 填充不透明度，0~1；不传 = 0.12（题面区域图的老默认值）。
+   *
+   * 为什么要能调？——课件里的"水面""草地"这类环境元素需要实一些的填充，
+   * 0.12 的老默认是为"不等式区域"设计的，那种图恰恰要求填充越淡越好，
+   * 免得盖住网格。两类需求的合适值差一个数量级，不能共用一个写死的数。
+   */
+  fillOpacity?: number;
 }
 
 export interface CircleObject extends BaseObject {

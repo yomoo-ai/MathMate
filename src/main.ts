@@ -35,6 +35,7 @@ import { mountKnowledgePanel } from './ui/knowledgePanel';
 import { mountChatPanel } from './ui/chatPanel';
 import { mountPresentationMode, type PresentationHandle } from './ui/presentation';
 import { mountVerifyPanel } from './ui/verifyPanel';
+import { mountKeyField } from './ui/keyField';
 import { auditCoverage } from './protocol/coverage';
 import {
   mountNotebook,
@@ -907,12 +908,14 @@ solidModeInput.addEventListener('change', () => {
   localStorage.setItem('mm-solid-mode', solidModeInput.checked ? '1' : '0');
 });
 
-// Key 存 localStorage：只在用户本机浏览器里，不进代码、不进 git
-llmKeyInput.value = localStorage.getItem('mm-api-key') ?? '';
-llmKeyInput.addEventListener('input', () => {
-  // 清洗：删掉全角空格/弯引号/零宽字符等复制时带进的杂质（key 本身是纯 ASCII）
-  llmKeyInput.value = llmKeyInput.value.replace(/[^\x20-\x7E]/g, '');
-  localStorage.setItem('mm-api-key', llmKeyInput.value.trim());
+// Key 存 localStorage：只在用户本机浏览器里，不进代码、不进 git。
+// 填一次就该记住——所以输入框收起成「sk-••••••1a2f 已保存在本机」，
+// 而不是留一串看不出填没填的黑点（见 ui/keyField.ts）。
+mountKeyField({
+  input: llmKeyInput,
+  storageKey: 'mm-api-key',
+  emptyHint: '填一次就会记住：Key 只存放在这台设备的浏览器里，不会上传到服务器。',
+  savedHint: '换设备或清理浏览器数据后需要重填一次；Key 不会上传到服务器。',
 });
 
 /**
@@ -1021,11 +1024,12 @@ const ocrPreview = $<HTMLImageElement>('ocr-preview');
 const ocrBtn = $<HTMLButtonElement>('ocr-btn');
 const ocrOutput = $('ocr-output');
 
-// 视觉模型 Key 同样只存本机浏览器
-vlKeyInput.value = localStorage.getItem('mm-vl-key') ?? '';
-vlKeyInput.addEventListener('input', () => {
-  vlKeyInput.value = vlKeyInput.value.replace(/[^\x20-\x7E]/g, '');
-  localStorage.setItem('mm-vl-key', vlKeyInput.value.trim());
+// 视觉模型 Key 同样只存本机浏览器；可以留空（留空时用上面那把 DeepSeek Key 识图）
+mountKeyField({
+  input: vlKeyInput,
+  storageKey: 'mm-vl-key',
+  emptyHint: '可以留空：留空时用上面那把 DeepSeek Key 识图。填了会更准，同样只存在本机。',
+  savedHint: '换设备或清理浏览器数据后需要重填一次；Key 不会上传到服务器。',
 });
 
 // 识别模型选择也记在本机。实测（2026-10-29）：几何图的标记识别 GLM-4.6V 更准，

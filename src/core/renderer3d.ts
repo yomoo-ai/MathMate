@@ -80,8 +80,19 @@ const COLORS = {
 /** 视频讲解的"重点色"（与 2D 一致）：本句讲到的棱换成暖橙 */
 const HL_COLOR = 0xea580c;
 
-/** 标注文字色（与 2D 的 ACCENT_CSS 一致）：比线条的橙更深一档，远看也认得出是字 */
-const ANN_TEXT = '#c2410c';
+// -------------------------------------------------------------
+// 主题化颜色（与 2D 的 setBg 同一套思路）：
+// 浅色工程风是默认值；课件深色主题下棱、标签、标注都要换成亮色系，
+// 否则深底上深灰棱几乎隐身（真踩过：将军饮马的水面在旧默认下消失）。
+// -------------------------------------------------------------
+const DARK_FOLLOW = {
+  edge: '#9aa6c0',
+  edgeHidden: '#5f6a82',
+  label: '#e8ecf6',
+  ann: '#f0a468',
+};
+
+type Follow3 = { edge?: string; edgeHidden?: string; label?: string; ann?: string };
 
 /** 三条坐标轴的颜色：沿用数学软件的约定（x 红 / y 绿 / z 蓝），但调低饱和 */
 const AXIS_COLORS = {
@@ -178,6 +189,40 @@ export class Scene3DRenderer {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
+  /** 主题化颜色：默认浅色工程风，深色课件走 setBg 换 */
+  private theme: { bg: string; edge: string; edgeHidden: string; label: string; ann: string } = {
+    bg: '#f7f6f3',
+    edge: '#33322e',
+    edgeHidden: '#8f8c83',
+    label: '#2c2c2a',
+    ann: '#c2410c',
+  };
+
+  /**
+   * 设置画布配色（背景 + 棱/标签/标注的跟随色）。
+   * 立即生效：改清屏色 + 重建当前场景（材质颜色在建对象时取自 theme）。
+   */
+  setBg(bg: string, follow?: Follow3) {
+    this.theme = {
+      bg,
+      edge: DARK_FOLLOW.edge,
+      edgeHidden: DARK_FOLLOW.edgeHidden,
+      label: DARK_FOLLOW.label,
+      ann: DARK_FOLLOW.ann,
+    };
+    for (const [k, v] of Object.entries(follow ?? {})) {
+      if (v != null) (this.theme as Record<string, string>)[k] = v;
+    }
+    this.renderer.setClearColor(new THREE.Color(this.theme.bg), 1);
+    if (this.data) this.setScene(this.data, this.params, false);
+  }
+
+  /**
+   * 参数被拖拽改变时回调——与 2D 的同名接口对齐。
+   * 3D 场景目前没有可拖点（拖拽只用于轨道旋转），所以本字段暂无人触发；
+   * 留着是为了让外壳能用同一个联合类型管理两种渲染器。
+   */
+  onParamChange?: (name: string, value: number) => void;
   /** 主光：方向固定在世界坐标，每帧平移到物体中心 */
   private keyLight: THREE.DirectionalLight;
   private contentGroup = new THREE.Group();
@@ -530,7 +575,7 @@ export class Scene3DRenderer {
         this.annGroup.add(line);
       }
       if (mark.text && mark.at) {
-        const s = this.makeLabel(mark.text, ANN_TEXT);
+        const s = this.makeLabel(mark.text, this.theme.ann);
         s.position.copy(toV3(mark.at));
         this.annGroup.add(s);
       }
@@ -1156,9 +1201,9 @@ export class Scene3DRenderer {
     if (!pa || !pb) return; // 引用了不存在的顶点：跳过，体检器会报
 
     const geo = new THREE.BufferGeometry().setFromPoints([toV3(pa), toV3(pb)]);
-    const solidMat = new THREE.LineBasicMaterial({ color: obj.color ? new THREE.Color(obj.color) : COLORS.edge });
+    const solidMat = new THREE.LineBasicMaterial({ color: obj.color ? new THREE.Color(obj.color)  : this.theme.edge });
     const dashedMat = new THREE.LineDashedMaterial({
-      color: obj.color ? new THREE.Color(obj.color) : COLORS.edgeHidden,
+      color: obj.color ? new THREE.Color(obj.color)  : this.theme.edgeHidden,
       dashSize: this.radius * 0.06,
       gapSize: this.radius * 0.045,
     });
@@ -1510,7 +1555,7 @@ export class Scene3DRenderer {
         list = [];
         this.curvedPieces.set(g.id, list);
       }
-      const color = new THREE.Color(g.color ?? COLORS.edge);
+      const color = new THREE.Color(g.color ?? this.theme.edge);
 
       // 段数每帧会变（视角一转，虚实分界点就移动），所以按 runs 的长度
       // 现取现建；多出来的旧段藏起来，不删——下一帧可能又用得上
@@ -1667,7 +1712,7 @@ export class Scene3DRenderer {
   private makeLabel(text: string, color?: string): THREE.Sprite {
     const s = makeTextSprite(text, {
       worldHeight: this.labelHeight(),
-      color: color ?? COLORS.label,
+      color: color ?? this.theme.label,
     });
     s.material.depthTest = false;
     s.renderOrder = 10;

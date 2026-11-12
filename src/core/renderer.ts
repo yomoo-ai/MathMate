@@ -192,6 +192,32 @@ export class SceneRenderer {
   /** 参数被拖拽改变时回调，供 UI（滑杆、数值）同步 */
   onParamChange?: (name: string, value: number) => void;
 
+  // -------------------------------------------------------------
+  // 主题化颜色：默认沿用 COLORS 的浅色工程风。
+  // 课件板块的深色炫酷主题通过 setBg() 整组换掉，网格/刻度/标签跟着变，
+  // 否则深底上会留下看不清的深灰细线（真踩过：水面在 0.12 不透明度下消失）。
+  // -------------------------------------------------------------
+  private theme = {
+    bg: '#f7f6f3',
+    grid: '#d8d5cc',
+    axis: '#6b6960',
+    tick: '#6b6960',
+    label: '#2c2c2a',
+  };
+
+  /**
+   * 设置画布配色（背景 + 网格/轴/刻度/标签的跟随色）。
+   * 只影响后续重建；调用方通常在 setScene 之前（或切主题时触发一次重建）。
+   */
+  setBg(bg: string, follow?: { grid?: string; axis?: string; tick?: string; label?: string }) {
+    this.theme = { bg, grid: '#8b93a7', axis: '#8b93a7', tick: '#8b93a7', label: '#e8ecf6' };
+    for (const [k, v] of Object.entries(follow ?? {})) {
+      if (v != null) (this.theme as Record<string, string>)[k] = v;
+    }
+    this.scene.background = new THREE.Color(this.theme.bg);
+    if (this.currentScene) this.rebuild();
+  }
+
   constructor(container: HTMLElement) {
     this.container = container;
 
@@ -1193,7 +1219,7 @@ export class SceneRenderer {
     this.gridGroup.add(
       new THREE.LineSegments(
         gridGeo,
-        new THREE.LineBasicMaterial({ color: COLORS.grid }),
+        new THREE.LineBasicMaterial({ color: this.theme.grid }),
       ),
     );
 
@@ -1214,7 +1240,7 @@ export class SceneRenderer {
       this.gridGroup.add(
         new THREE.LineSegments(
           axisGeo,
-          new THREE.LineBasicMaterial({ color: COLORS.axis }),
+          new THREE.LineBasicMaterial({ color: this.theme.axis }),
         ),
       );
     }
@@ -1229,7 +1255,7 @@ export class SceneRenderer {
       if (Math.abs(x) < 1e-9) continue;
       const s = makeTextSprite(formatTick(x), {
         worldHeight: labelH,
-        color: COLORS.tick,
+        color: this.theme.tick,
       });
       s.position.set(x, -labelH * 1.1, 0);
       this.gridGroup.add(s);
@@ -1243,7 +1269,7 @@ export class SceneRenderer {
       if (Math.abs(y) < 1e-9) continue;
       const s = makeTextSprite(formatTick(y), {
         worldHeight: labelH,
-        color: COLORS.tick,
+        color: this.theme.tick,
       });
       s.position.set(-labelH * 0.9, y, 0);
       this.gridGroup.add(s);
@@ -1251,7 +1277,7 @@ export class SceneRenderer {
     }
     const origin = makeTextSprite('O', {
       worldHeight: labelH,
-      color: COLORS.tick,
+      color: this.theme.tick,
     });
     origin.position.set(-labelH * 0.9, -labelH * 1.1, 0);
     this.gridGroup.add(origin);
@@ -1310,6 +1336,23 @@ export class SceneRenderer {
     mesh.userData = { __dot: true };
     this.objectGroup.add(mesh);
 
+    // 光晕：两层同色半透明圆环，外层大而淡、内层小而实。
+    // 用普通透明混合而不是 additive——浅色主题下 additive 会把光晕洗白。
+    if (obj.glow) {
+      const c = obj.color ?? COLORS.point;
+      for (const [k, op] of [
+        [3.1, 0.1],
+        [2.0, 0.2],
+      ] as const) {
+        const halo = new THREE.Mesh(
+          new THREE.CircleGeometry(r * k, 32),
+          new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: op }),
+        );
+        halo.position.set(at[0], at[1], 0.19);
+        this.objectGroup.add(halo);
+      }
+    }
+
     // 可拖拽的点：加一个透明的大圆作为「拾取热区」，方便点中
     if (obj.draggable) {
       const pick = new THREE.Mesh(
@@ -1329,7 +1372,7 @@ export class SceneRenderer {
     if (obj.label) {
       const s = makeTextSprite(obj.label, {
         worldHeight: this.labelH(),
-        color: COLORS.label,
+        color: this.theme.label,
       });
       s.position.set(
         at[0] + (obj.labelOffset?.[0] ?? 0),
@@ -1367,13 +1410,16 @@ export class SceneRenderer {
     const line = new THREE.Line(geo, material);
     if (obj.dashed) line.computeLineDistances();
     this.objectGroup.add(line);
+    // 光晕：线身下垫一条 4~6px 的同色低透明宽带（借高亮描边的带状网格思路，
+    // 但常显、可调宽），核心线在上层保持 1px 精密线框——粗的不是线，是光。
+    if (obj.glow) this.addGlowStroke(from, to, obj.color ?? COLORS.segment);
     // 高亮用的加粗描边（默认隐藏，视频讲解讲到这条边时才显示）
     this.addThickStroke(from, to);
 
     if (obj.label) {
       const s = makeTextSprite(obj.label, {
         worldHeight: this.labelH(),
-        color: COLORS.label,
+        color: this.theme.label,
       });
       // 标签默认压在线段中点上；竖直线（如对称轴）的标签会正好压住线身上的
       // 其他标注（如顶点标签）。三步避让：
@@ -1468,7 +1514,8 @@ export class SceneRenderer {
         new THREE.MeshBasicMaterial({
           color,
           transparent: true,
-          opacity: 0.12,
+          // 课件的环境元素（水面/草地）可以要求更实的填充；题面区域图维持老默认
+          opacity: obj.fillOpacity ?? 0.12,
           side: THREE.DoubleSide,
         }),
       );
@@ -1536,6 +1583,47 @@ export class SceneRenderer {
     this.objectGroup.add(mesh);
   }
 
+  /** 光晕宽带：比 addThickStroke 宽一档、低透明度、常显，营造"发光路径" */
+  private addGlowStroke(
+    from: [number, number],
+    to: [number, number],
+    color: string | number,
+  ) {
+    const dx = to[0] - from[0];
+    const dy = to[1] - from[1];
+    const l = Math.hypot(dx, dy);
+    if (l < 1e-9) return;
+    const w = this.pxToWorld(9) / 2;
+    const nx = (-dy / l) * w;
+    const ny = (dx / l) * w;
+    const z = 0.09; // 压在核心线（0.1）之下、网格之上
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(
+        [
+          from[0] + nx, from[1] + ny, z,
+          to[0] + nx, to[1] + ny, z,
+          to[0] - nx, to[1] - ny, z,
+          from[0] - nx, from[1] - ny, z,
+        ],
+        3,
+      ),
+    );
+    geo.setIndex([0, 1, 2, 0, 2, 3]);
+    const mesh = new THREE.Mesh(
+      geo,
+      new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.22,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    this.objectGroup.add(mesh);
+  }
+
   private buildCircle(obj: CircleObject) {
     const center = this.vec(obj.center);
     if (!center) return;
@@ -1570,7 +1658,7 @@ export class SceneRenderer {
     if (obj.label) {
       const s = makeTextSprite(obj.label, {
         worldHeight: this.labelH(),
-        color: COLORS.label,
+        color: this.theme.label,
       });
       s.position.set(
         center[0] + (obj.labelOffset?.[0] ?? 0),
@@ -1699,7 +1787,7 @@ export class SceneRenderer {
     if (obj.label) {
       const s = makeTextSprite(obj.label, {
         worldHeight: this.labelH(),
-        color: COLORS.label,
+        color: this.theme.label,
       });
       s.position.set(
         pts[0].x + (obj.labelOffset?.[0] ?? 0),
