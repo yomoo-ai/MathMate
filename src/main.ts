@@ -33,6 +33,9 @@ import type { ChatContext } from './llm/chatAgent';
 import type { ChatAction } from './llm/actProtocol';
 import { mountKnowledgePanel } from './ui/knowledgePanel';
 import { mountChatPanel } from './ui/chatPanel';
+import { mountPresentationMode, type PresentationHandle } from './ui/presentation';
+import { mountVerifyPanel } from './ui/verifyPanel';
+import { auditCoverage } from './protocol/coverage';
 import {
   mountNotebook,
   loadEntries,
@@ -74,6 +77,22 @@ function verifyAny(scene: AnyScene): Issue[] {
 const canvasContainer = $('canvas-container');
 /** 画布舞台：渲染器量这一层的尺寸；知识抽屉是它的兄弟节点 */
 const stageEl = $('stage');
+/**
+ * 核验清单浮层（画布左上角）。
+ * 挂载得足够早：初始化时第一次 applyScene 就要往里写，晚一步首屏就是空的。
+ */
+const verifyPanel = mountVerifyPanel(stageEl);
+
+/**
+ * 刷新「核验清单」：把这次体检验了哪些关系摊给用户看。
+ *
+ * 只在这里统一做，是因为它必须和「当前生效的场景」严格同步——
+ * 换题、拖滑杆、载入题本都会走 applyScene，跟着它走就不会显示上一题的结论。
+ */
+function refreshCoverage(scene: AnyScene) {
+  const constraints = (scene as { constraints?: unknown[] }).constraints;
+  verifyPanel.update(auditCoverage(constraints, verifyAny(scene)));
+}
 const tabsEl = $<HTMLSelectElement>('scene-tabs'); // 演示场景下拉框
 const infoEl = $('scene-info');
 const paramsEl = $('params');
@@ -105,6 +124,32 @@ function resetLog() {
   llmLogBody.textContent = '';
   llmLog.hidden = true;
   llmLog.open = false;
+}
+
+/**
+ * 在飞生成请求的「作废开关」。
+ *
+ * 两个都要：
+ *   - genSeq 计数器：AbortController 只能掐断**还在路上**的请求；如果响应
+ *     已经回来了、只是还没执行到 applyScene，abort 拦不住它。用序号比对兜底。
+ *   - AbortController：真的把 HTTP 请求掐掉，省下后面几轮重试的调用费。
+ *
+ * 为什么必须有：模型慢的时候换题是常态（一次生成 20~60s）。旧请求晚到
+ * 会把新图冲掉——用户看到的是"我明明换题了，图又变回去了"。
+ */
+let genSeq = 0;
+let genAbort: AbortController | null = null;
+
+/** 任何"换场景"的动作（新生成 / 选内置场景 / 手动载入 JSON）都要先调它 */
+function cancelPendingGeneration() {
+  genAbort?.abort();
+  genAbort = null;
+  genSeq++;
+}
+
+/** 主动取消不是故障，不该弹红字 */
+function isAbortError(err: unknown): boolean {
+  return (err as Error | undefined)?.name === 'AbortError';
 }
 
 function pushLog(m: string) {
@@ -320,6 +365,7 @@ function applyScene(
     refreshReadouts3D(scene);
     setupSteps(scene.steps);
     syncLearningPanels(scene);
+    refreshCoverage(scene);
     return;
   }
 
@@ -341,10 +387,12 @@ function applyScene(
   if (board) renderDeriveBoard(scene.steps ?? [], notice);
   setupSteps(scene.steps);
   syncLearningPanels(scene);
+  refreshCoverage(scene);
 }
 
 /** 诊断页专用：跳过 hash 逻辑直接应用任意场景（不用于正常入口） */
 export function applySceneForDebug(scene: Scene) {
+  cancelPendingGeneration();
   applyScene(scene);
 }
 
@@ -354,6 +402,12 @@ export function applySceneForDebug(scene: Scene) {
 let stepIndex = 0;
 /** 当前场景的分步讲解（2D / 3D 共用一套导航逻辑） */
 let currentSteps: StepDef[] = [];
+/**
+ * 投屏模式句柄。
+ * 这里先声明、稍后赋值：setupSteps 可能在模块初始化阶段就被调用，
+ * 那时下面的 mountPresentationMode 还没执行，用 const 会踩 TDZ。
+ */
+let presentation: PresentationHandle | null = null;
 
 /** 把 "文字 $公式$ 文字" 渲染成 HTML：统一实现见 ui/mathText（含脏数据清洗） */
 
@@ -404,6 +458,8 @@ function showStep() {
   } else {
     renderer.setStep(stepIndex);
   }
+  // 底部步骤条跟着走（未进入投屏时它是空操作）
+  presentation?.sync();
 }
 
 $('step-prev').addEventListener('click', () => {
@@ -417,7 +473,76 @@ $('step-next').addEventListener('click', () => {
 
 // 讲解视频工作台：把当前场景交给独立区域播放（阶段②）
 // 注意传的是场景数据本体 + 当前参数，工作台用自己的渲染器，不碰主画布
-const videoStudio = mountVideoStudio();
+const videoStudio = mountVideoStudio({
+  onClose: onVideoClosed,
+  escLayer: videoEscLayer,
+});
+
+// ---- 学习面板与视频的宿主切换 ----
+//
+// 视频是全屏覆盖层，主画布上的知识点抽屉和提问气泡会被盖住。
+// 做法：面板是**同一组 DOM**，视频打开时搬进视频画布（浮在视频上），
+// 关闭时搬回主画布。聊天历史、知识点缓存都只有一份，不会多调模型。
+function moveLearningPanels(intoVideo: boolean) {
+  if (intoVideo) {
+    const host = videoStudio.panelHost();
+    chatPanel.moveTo(host, host);
+    knowledgePanel.moveTo(host);
+  } else {
+    chatPanel.moveBack();
+    knowledgePanel.moveBack();
+  }
+  // 宿主变了，两个渲染器都得重新量一次画布
+  window.setTimeout(() => window.dispatchEvent(new Event('resize')), 80);
+}
+
+function onVideoClosed() {
+  moveLearningPanels(false);
+}
+
+/** Esc 分层退出：先收面板，再退全屏，最后才关视频（分层在工作台里实现） */
+function videoEscLayer(): boolean {
+  if (!videoStudio.isOpen()) return false;
+  if (chatPanel.isOpen()) {
+    chatPanel.close();
+    return true;
+  }
+  if (knowledgePanel.isOpen()) {
+    knowledgePanel.close();
+    return true;
+  }
+  return false;
+}
+
+// 投屏模式：讲台上只留「图 + 参数 + 步骤」。
+// 键盘（← → 空格 PageUp/PageDown 翻步、Esc 退出、P 切换）由它自己接管；
+// 输入框聚焦时自动让路，视频工作台打开时也不抢。
+presentation = mountPresentationMode({
+  getStep: () => ({
+    index: stepIndex,
+    total: currentSteps.length,
+    title: currentSteps[stepIndex]?.title ?? '',
+  }),
+  onPrev: () => {
+    if (stepIndex > 0) {
+      stepIndex -= 1;
+      showStep();
+    }
+  },
+  onNext: () => {
+    if (stepIndex < currentSteps.length - 1) {
+      stepIndex += 1;
+      showStep();
+    }
+  },
+  onLayoutChange: () => {
+    // 侧栏是瞬时显隐（没有过渡），但 flex 重排要一帧才落定，
+    // 量早了会按旧宽度取景，图看着偏在一边
+    window.setTimeout(() => window.dispatchEvent(new Event('resize')), 60);
+  },
+});
+
+// 核验清单浮层已在上方随 stageEl 一起挂载，这里不用再管。
 $('step-video').addEventListener('click', () => {
   const title = currentEntry?.name ?? 'MathMate 讲解视频';
   // 题目原文 = LLM 输入框里的内容（拍照转录后也会回填到这个框）；
@@ -428,6 +553,8 @@ $('step-video').addEventListener('click', () => {
   } else {
     videoStudio.open(activeScene, params, title, problem);
   }
+  // 学习面板搬进视频层：视频盖住了主画布，留在原处就点不到了
+  moveLearningPanels(true);
 });
 
 // ---------------------------------------------------------------
@@ -445,6 +572,8 @@ function activeSceneAny(): AnyScene {
 
 const knowledgePanel = mountKnowledgePanel(canvasContainer, {
   onLayoutChange: () => {
+    // 视频里展开抽屉会挡住画面，讲解还在走的话学生跟不上 → 自动暂停
+    videoStudio.pauseIfPlaying();
     // 抽屉展开/收起是 0.22s 的过渡：等它落定再让渲染器量一次容器宽度，
     // 量早了会按半宽取景，动画结束后图看着偏在一边
     window.setTimeout(() => window.dispatchEvent(new Event('resize')), 240);
@@ -458,11 +587,15 @@ const knowledgePanel = mountKnowledgePanel(canvasContainer, {
 function chatContext(): ChatContext {
   const scene = activeSceneAny();
   const facts = buildFactSheet(scene, params);
+  // 视频里提问：步骤 = 讲稿的句子、当前步 = 正在播放的这句。
+  // 学生在第 5 句暂停问"这句什么意思"，答的就是第 5 句，不是主画布的步骤。
+  // 讲稿还没生成时退回主画布步骤（题目+图形条件照样够答）。
+  const vSteps = videoStudio.isOpen() ? videoStudio.narrationSteps() : null;
   return {
     problem: currentProblem(),
     facts: facts.text,
-    steps: currentSteps.map((s) => ({ title: s.title, text: s.text })),
-    stepIndex,
+    steps: vSteps ?? currentSteps.map((s) => ({ title: s.title, text: s.text })),
+    stepIndex: vSteps ? videoStudio.currentCue() : stepIndex,
     ids: facts.ids,
   };
 }
@@ -472,6 +605,8 @@ const chatPanel = mountChatPanel({
   bubbleHost: stageEl,
   getContext: chatContext,
   onAction: applyChatAction,
+  // 视频播放中点开提问 → 自动暂停，别让讲解自己往下走
+  onOpen: () => videoStudio.pauseIfPlaying(),
 });
 
 /**
@@ -481,6 +616,14 @@ const chatPanel = mountChatPanel({
  * 这里再兜一层：推导模式没有画布，高亮直接不执行。
  */
 function applyChatAction(act: ChatAction, undo: boolean) {
+  // 视频里的联动：跳句 / 在视频自己的渲染器上高亮，主画布不动。
+  // 只在讲稿已生成时走这条路——jump 的步号是按讲稿句子算的。
+  if (videoStudio.isOpen() && videoStudio.hasNarration()) {
+    if (act.jump) videoStudio.jumpToCue(act.jump);
+    if (undo) videoStudio.applyFocus([], true);
+    else if (act.focus?.length) videoStudio.applyFocus(act.focus, false);
+    return;
+  }
   if (act.jump) {
     stepIndex = Math.max(0, Math.min(act.jump - 1, currentSteps.length - 1));
     showStep();
@@ -517,6 +660,8 @@ function syncLearningPanels(scene: AnyScene) {
 
 function loadEntry(entry: SceneEntry) {
   currentEntry = entry;
+  // 用户主动换场景：在飞的生成请求作废，别让它回来把这张图冲掉
+  cancelPendingGeneration();
   // 下拉框同步选中项
   tabsEl.value = entry.key;
   // 场景写进 URL：刷新后停在原场景，不用每次从「二次函数」重新点
@@ -695,6 +840,7 @@ $('json-parse-btn').addEventListener('click', () => {
     // 手贴的 JSON 也做数值体检——error 不拦截（自己写的自己负责），
     // 但问题会以报告面板的形式逐条亮出来，方便对照画面找"为什么少了个点"
     renderIssueReport(jsonReport, verifyAny(result.scene));
+    cancelPendingGeneration();
     applyScene(result.scene);
     // 自定义 JSON 不属于任何内置演示 → 下拉框回到占位项
     tabsEl.value = '';
@@ -736,6 +882,7 @@ function openFromNotebook(entry: NotebookEntry) {
       `✗ 这条存档打不开（可能是旧版本存下的）：${result.errors.slice(0, 2).join('；')}`;
     return;
   }
+  cancelPendingGeneration();
   applyScene(result.scene);
   jsonInput.value = JSON.stringify(result.scene, null, 2);
   tabsEl.value = ''; // 题本里的存档不是内置演示 → 下拉框回到占位项
@@ -775,6 +922,12 @@ llmKeyInput.addEventListener('input', () => {
  */
 async function generateScene(prompt: string, source: NotebookSource = 'text') {
   const btn = $<HTMLButtonElement>('llm-btn');
+  // 先作废上一个还在路上的请求
+  cancelPendingGeneration();
+  const ctl = new AbortController();
+  genAbort = ctl;
+  const my = genSeq;
+
   btn.disabled = true;
   llmOutput.className = 'msg';
   llmOutput.textContent = '→ 正在调用模型……';
@@ -794,8 +947,11 @@ async function generateScene(prompt: string, source: NotebookSource = 'text') {
       renderIssueReport(llmReport, issues);
     };
     const raw: AnyScene = solidModeInput.checked
-      ? await requestSceneFromPrompt3D(prompt, pushLog, onIssues)
-      : await requestSceneFromPrompt(prompt, pushLog, onIssues);
+      ? await requestSceneFromPrompt3D(prompt, pushLog, onIssues, ctl.signal)
+      : await requestSceneFromPrompt(prompt, pushLog, onIssues, ctl.signal);
+    // 迟到的结果：已经有更新的请求（或用户自己换了题）——这份直接丢掉，
+    // 绝不能再往下走 applyScene，否则会把新图冲回去
+    if (my !== genSeq) return;
     // 兜底闸门：声明了"要出图"却一个对象都没有 → 降级成推导板书，
     // 而不是渲染一张空坐标轴
     const guarded = isScene3D(raw) ? { scene: raw, notice: null } : guardVisual(raw);
@@ -826,8 +982,13 @@ async function generateScene(prompt: string, source: NotebookSource = 'text') {
       ` · 读数 ${(scene.readouts ?? []).length} 条`;
     // 生成后把右侧面板滚到参数区，防止小屏幕上滑杆在视野之外
     paramsEl.scrollIntoView({ block: 'nearest' });
+  } catch (err) {
+    // 主动取消 / 已经被更新的请求顶掉：静默收场，别弹红字
+    if (isAbortError(err) || my !== genSeq) return;
+    throw err;
   } finally {
-    btn.disabled = false;
+    // 旧请求的 finally 不能解锁按钮——新请求还在跑，一点就又发一次
+    if (my === genSeq) btn.disabled = false;
   }
 }
 

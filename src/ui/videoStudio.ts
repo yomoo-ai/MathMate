@@ -65,6 +65,36 @@ export interface VideoStudioHandle {
     /** 题目原文（可选）：播放时作为开场卡片展示 */
     problem?: string,
   ): void;
+  /** 工作台当前是否打开 */
+  isOpen(): boolean;
+  /** 讲稿是否已生成（生成过才有「按句跳转」这回事） */
+  hasNarration(): boolean;
+  /**
+   * 讲稿句子（答疑上下文用）。视频里的「步骤」就是讲稿的一句话，
+   * 学生在第 5 句暂停问"这句什么意思"，模型看到的应该就是第 5 句。
+   * 还没生成过讲稿返回 null——此时答疑退回主画布的解题步骤。
+   */
+  narrationSteps(): Array<{ title: string; text: string }> | null;
+  /** 当前句下标（0 起） */
+  currentCue(): number;
+  /** 暂停并跳到第 n 句（n 从 1 起，来自答疑联动指令） */
+  jumpToCue(n: number): void;
+  /** 在视频自己的渲染器上做 / 撤销高亮（答疑 focus 联动），不碰主画布 */
+  applyFocus(ids: string[], undo: boolean): void;
+  /** 正在播放就暂停（打开学习面板时调用，别让讲解自己往下走） */
+  pauseIfPlaying(): void;
+  /** 视频画布：学习面板搬进来时的宿主 */
+  panelHost(): HTMLElement;
+}
+
+export interface VideoStudioOpts {
+  /** 工作台关闭后回调（学习面板要搬回主画布） */
+  onClose?: () => void;
+  /**
+   * Esc 分层退出：返回 true 表示这一层已经处理了 Esc（比如先收起聊天面板），
+   * 工作台就不再往下关。不加这层，Esc 一步关掉整个视频，播放位置直接丢失。
+   */
+  escLayer?: () => boolean;
 }
 
 /** 公式渲染、纯文本化统一走 ui/mathText：板书乱码的清洗规则只维护一份 */
@@ -103,7 +133,7 @@ const BUILD_MAX_MS = 6500;
 /** 讲到某句才出现的对象：用这个时长"长"出来，不要硬切换 */
 const REVEAL_MS = 320;
 
-export function mountVideoStudio(): VideoStudioHandle {
+export function mountVideoStudio(opts: VideoStudioOpts = {}): VideoStudioHandle {
   const root = document.getElementById('video-studio') as HTMLElement;
   buildDom(root);
 
@@ -1099,10 +1129,14 @@ export function mountVideoStudio(): VideoStudioHandle {
     r2d?.clearOverlay();
     r3d?.clearFocus();
     r3d?.setActive(false);
+    // 学习面板还挂在视频层里，通知外面把它们搬回主画布
+    opts.onClose?.();
   });
   document.addEventListener('keydown', (ev) => {
     if (closed || root.hidden) return;
     if (ev.key === 'Escape') {
+      // 分层退出：先收面板，再退全屏，最后才关视频
+      if (opts.escLayer?.()) return;
       if (fullscreen) exitFullscreen();
       else closeBtn.click();
       return;
@@ -1307,5 +1341,33 @@ export function mountVideoStudio(): VideoStudioHandle {
       applyBeatStatic(0, true);
       subEl.classList.add('show');
     },
+    isOpen: () => !closed && !root.hidden,
+    hasNarration: () => !!tl && tl.beats.length > 0,
+    narrationSteps: () =>
+      tl && tl.beats.length > 0
+        ? tl.beats.map((b, i) => ({ title: `视频第 ${i + 1} 句`, text: b.say }))
+        : null,
+    currentCue: () => cueIdx,
+    jumpToCue(n: number) {
+      if (!tl) return;
+      // 联动跳句 = 先停（语音、rAF、开场卡全停），再落到目标句的完整状态
+      pause();
+      applyBeatStatic(n - 1, true);
+      subEl.classList.add('show');
+    },
+    applyFocus(ids: string[], undo: boolean) {
+      if (boardMode) return;
+      if (undo) {
+        r2d?.clearFocus();
+        r3d?.clearFocus();
+        return;
+      }
+      if (space === '3d') r3d?.applyFocus(ids, [], []);
+      else r2d?.applyFocus(ids, [], []);
+    },
+    pauseIfPlaying: () => {
+      if (playing) pause();
+    },
+    panelHost: () => stage,
   };
 }

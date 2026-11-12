@@ -207,12 +207,29 @@ export async function requestKnowledge(
   return points;
 }
 
-/** 缓存键：题目 + 图不同就要重新问 */
+/** FNV-1a 32 位：够短、够散，只为把长题面和 id 序列压成稳定的短串 */
+function hash32(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * 缓存键：题目 + 图不同就要重新问。
+ *
+ * 早先用的是「标题 + 对象数 + 约束数 + 题面前 160 字」——同标题、同规模、
+ * 开头又相似的题（补习班一天讲五道"正方体"是很平常的事）会撞键，
+ * 抽屉里就出现上一道题的知识点。现在把对象 id 序列和整段题面都哈希进去。
+ */
 export function knowledgeKey(problem: string, scene: Scene | Scene3D): string {
   const title = scene.meta?.title ?? '';
-  const n = scene.objects.length;
+  // 用 id 序列而不是"个数"：同样 8 个点，换一组点就是另一道题
+  const ids = scene.objects.map((o) => o.id).join(',');
   const c = (scene.constraints ?? []).length;
-  return `${title}|${n}|${c}|${problem.slice(0, 160)}`;
+  return `${title}|${c}|${hash32(ids)}|${hash32(problem)}`;
 }
 
 /** 抽屉里显示公式前统一走这里（和板书同一套渲染） */

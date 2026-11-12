@@ -101,6 +101,37 @@ interface OverlayItem {
   ribbon: boolean;
 }
 
+/**
+ * 标签的"身份"——决定避让时谁先占位。
+ *
+ * 点标签最优先：它必须紧贴着自己的圆点，挪远了学生就认不出是哪个点；
+ * 线段/曲线标签可以沿线滑动，挪一点无所谓。轴刻度数字不参与排序，
+ * 它们只当障碍（刻度跟网格线绑死，挪了反而错位）。
+ */
+type LabelKind = 'point' | 'segment' | 'circle' | 'function' | 'curve';
+
+interface LabelRec {
+  sprite: THREE.Sprite;
+  kind: LabelKind;
+  /** 模型显式给了 labelOffset：位置是刻意指定的，避让时不动，只当障碍 */
+  pinned: boolean;
+  /**
+   * 点标签所属的点 id。
+   *
+   * 避让时要把这个点自己的圆盘从障碍里排除——否则每个点标签都会
+   * 和自己的点"相撞"，全部被往上顶一档，标签整体飘起来，比不避让还难看。
+   */
+  ownerId?: string;
+}
+
+/** 标签的世界空间包围盒 */
+interface LabelBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
 export class SceneRenderer {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
@@ -137,6 +168,12 @@ export class SceneRenderer {
 
   /** 本轮重建中收集到的内容点坐标（供自动兜底取景用） */
   private contentPts: Array<{ x: number; y: number }> = [];
+  /** 本轮重建收集到的标签（供统一避让用） */
+  private labels: LabelRec[] = [];
+  /** 本轮重建的坐标轴刻度数字：只当避让障碍，永不移动 */
+  private tickSprites: THREE.Sprite[] = [];
+  /** 点的圆盘位置：标签避让时也要躲开（标签压在点上会被误读成点的编号） */
+  private dotAnchors: Array<{ x: number; y: number; id: string }> = [];
   /** setScene 时的原始 view——兜底扩视野的幅度以它为基准，防止无限放大 */
   private baseView: ViewRange | null = null;
 
@@ -240,6 +277,9 @@ export class SceneRenderer {
     this.pickables = [];
     this.idGroups.clear();
     this.contentPts = [];
+    this.labels = [];
+    this.tickSprites = [];
+    this.dotAnchors = [];
 
     this.updateCamera();
     this.buildGrid();
@@ -265,6 +305,9 @@ export class SceneRenderer {
     this.autoFitView();
 
     this.applyStep();
+    // 标签避让要等所有对象都建完才能算——冲突是"两个标签之间"的关系，
+    // 建到一半时还不知道后面还有谁会压上来
+    this.layoutLabels();
     // 标注按世界坐标画，视野/尺寸变了要按新比例重画一遍（否则弧会变形、字号会不对）
     this.drawAnnotations();
     this.renderer.render(this.scene, this.camera);
@@ -1000,6 +1043,122 @@ export class SceneRenderer {
   }
 
   // ---------------------------------------------------------------
+  // 标签避让
+  //
+  // 各 buildXxx 只知道"自己这个标签相对自己的几何体该放哪"，
+  // 彼此之间一无所知——两个点靠得近，两个字母就叠成一团；
+  // 线段标签翻了面，就落进坐标轴刻度带里。
+  // 这里在所有对象建完之后统一收拾一遍：点标签先占位，
+  // 被压住的标签按最小位移往外推，没冲突的一个都不动。
+  // ---------------------------------------------------------------
+
+  /** 标签包围盒：取可视尺寸的 86%（贴图里自带内边距，全算上会过度避让） */
+  private labelBox(s: THREE.Sprite, at: THREE.Vector3, pad: number): LabelBox {
+    const hw = (s.scale.x * 0.86) / 2 + pad;
+    const hh = (s.scale.y * 0.86) / 2 + pad;
+    return { x0: at.x - hw, y0: at.y - hh, x1: at.x + hw, y1: at.y + hh };
+  }
+
+  private layoutLabels() {
+    if (this.labels.length === 0) return;
+    const lh = this.labelH();
+    const pad = lh * 0.14;
+    const boxes: LabelBox[] = [];
+
+    // 轴刻度数字：只当障碍。它们跟网格线绑死，挪了就跟坐标对不上。
+    for (const s of this.tickSprites) {
+      boxes.push(this.labelBox(s, s.position, pad * 0.5));
+    }
+    // 点的圆盘单独存：点标签要跳过"自己那个点"，否则每个标签都会把自己顶开
+    const dotBoxes = this.dotAnchors.map((d) => {
+      const h = this.pointR() * 1.6;
+      return {
+        id: d.id,
+        box: { x0: d.x - h, y0: d.y - h, x1: d.x + h, y1: d.y + h } as LabelBox,
+      };
+    });
+
+    const rank: Record<LabelKind, number> = {
+      point: 0,
+      segment: 1,
+      circle: 2,
+      function: 3,
+      curve: 3,
+    };
+    const ordered = [...this.labels].sort((a, b) => {
+      // 显式指定位置的先落座（它不会动，但要占住地方）
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return rank[a.kind] - rank[b.kind];
+    });
+
+    // 八个候选方向，按「挪到哪里最不让人觉得奇怪」排序：先上，再斜上，最后往下
+    const dirs: Array<[number, number]> = [
+      [0, 1],
+      [0.707, 0.707],
+      [-0.707, 0.707],
+      [1, 0],
+      [-1, 0],
+      [0.707, -0.707],
+      [-0.707, -0.707],
+      [0, -1],
+    ];
+    // 每外推一档 = 一个字高，最多三档
+    const unit = lh * 1.05;
+    // 候选位置必须完整落在视野内。避让本来是为了"看得清"，
+    // 把它推到画面外面（贴边的点最容易这样）就变成"看不见"了，反而更糟。
+    const view = this.currentScene!.view;
+    const inView = (b: LabelBox) =>
+      b.x0 >= view.xMin && b.x1 <= view.xMax && b.y0 >= view.yMin && b.y1 <= view.yMax;
+
+    for (const rec of ordered) {
+      const s = rec.sprite;
+      const at = s.position.clone();
+
+      if (!rec.pinned) {
+        const hits = (p: THREE.Vector3) => {
+          const b = this.labelBox(s, p, pad);
+          if (
+            boxes.some(
+              (o) => b.x0 < o.x1 && b.x1 > o.x0 && b.y0 < o.y1 && b.y1 > o.y0,
+            )
+          ) {
+            return true;
+          }
+          return dotBoxes.some(
+            (d) =>
+              d.id !== rec.ownerId &&
+              b.x0 < d.box.x1 &&
+              b.x1 > d.box.x0 &&
+              b.y0 < d.box.y1 &&
+              b.y1 > d.box.y0,
+          );
+        };
+        if (hits(at)) {
+          let placed = false;
+          for (let ring = 1; ring <= 3 && !placed; ring++) {
+            for (const [dx, dy] of dirs) {
+              const cand = at
+                .clone()
+                .add(new THREE.Vector3(dx * unit * ring, dy * unit * ring, 0));
+              const b = this.labelBox(s, cand, pad);
+              if (inView(b) && !hits(cand)) {
+                at.copy(cand);
+                placed = true;
+                break;
+              }
+            }
+          }
+          // 三圈都没找到空位：保持原位。宁可重叠，也别甩到画外去——
+          // 标签飞出取景框比两个字叠在一起更糟：学生会以为这个点没有名字。
+          if (placed) s.position.copy(at);
+        }
+      }
+
+      boxes.push(this.labelBox(s, s.position, pad));
+    }
+  }
+
+  // ---------------------------------------------------------------
   // 网格与坐标轴
   // ---------------------------------------------------------------
 
@@ -1074,6 +1233,7 @@ export class SceneRenderer {
       });
       s.position.set(x, -labelH * 1.1, 0);
       this.gridGroup.add(s);
+      this.tickSprites.push(s);
     }
     for (
       let y = Math.ceil(view.yMin / step) * step;
@@ -1087,6 +1247,7 @@ export class SceneRenderer {
       });
       s.position.set(-labelH * 0.9, y, 0);
       this.gridGroup.add(s);
+      this.tickSprites.push(s);
     }
     const origin = makeTextSprite('O', {
       worldHeight: labelH,
@@ -1094,6 +1255,7 @@ export class SceneRenderer {
     });
     origin.position.set(-labelH * 0.9, -labelH * 1.1, 0);
     this.gridGroup.add(origin);
+    this.tickSprites.push(origin);
   }
 
   // ---------------------------------------------------------------
@@ -1135,6 +1297,7 @@ export class SceneRenderer {
     const at = this.vec(obj.at ?? '');
     if (!at) return;
     this.note(at[0], at[1]);
+    this.dotAnchors.push({ x: at[0], y: at[1], id: obj.id });
     const view = this.currentScene!.view;
     const r = this.pointR();
 
@@ -1174,6 +1337,12 @@ export class SceneRenderer {
         0.3,
       );
       this.objectGroup.add(s);
+      this.labels.push({
+        sprite: s,
+        kind: 'point',
+        pinned: !!obj.labelOffset,
+        ownerId: obj.id,
+      });
     }
   }
 
@@ -1207,9 +1376,12 @@ export class SceneRenderer {
         color: COLORS.label,
       });
       // 标签默认压在线段中点上；竖直线（如对称轴）的标签会正好压住线身上的
-      // 其他标注（如顶点标签）。两步避让：
+      // 其他标注（如顶点标签）。三步避让：
       // ① 沿法线推离线身，标签不压线；
-      // ② 竖直线段额外把标签挪到 72% 高度（贴近上端），远离中部的顶点等标注。
+      // ② 法线**统一朝上 / 朝右**——法线的正负由 from→to 的顺序决定，
+      //    同一形状换个写法就翻到另一侧。翻到下面那侧会落进坐标轴刻度带，
+      //    截图里 BC 的标签压住"6""8"就是这么来的；
+      // ③ 竖直线段额外把标签挪到 72% 高度（贴近上端），远离中部的顶点等标注。
       const dx = to[0] - from[0];
       const dy = to[1] - from[1];
       const len = Math.hypot(dx, dy) || 1;
@@ -1217,14 +1389,23 @@ export class SceneRenderer {
       const isVertical = Math.abs(dx) < 1e-6;
       const t = isVertical ? 0.72 : 0.5;
       const off = lh * 0.8;
-      const nx = (-dy / len) * off;
-      const ny = (dx / len) * off;
+      let nx = (-dy / len) * off;
+      let ny = (dx / len) * off;
+      if (!obj.labelOffset) {
+        // 更"竖直"的线看左右，其余看上下
+        const flip = Math.abs(dy) > Math.abs(dx) ? nx < 0 : ny < 0;
+        if (flip) {
+          nx = -nx;
+          ny = -ny;
+        }
+      }
       s.position.set(
         from[0] + dx * t + nx + (obj.labelOffset?.[0] ?? 0),
         from[1] + dy * t + ny + (obj.labelOffset?.[1] ?? 0),
         0.3,
       );
       this.objectGroup.add(s);
+      this.labels.push({ sprite: s, kind: 'segment', pinned: !!obj.labelOffset });
     }
   }
 
@@ -1397,6 +1578,7 @@ export class SceneRenderer {
         0.3,
       );
       this.objectGroup.add(s);
+      this.labels.push({ sprite: s, kind: 'circle', pinned: !!obj.labelOffset });
     }
   }
 
@@ -1481,6 +1663,7 @@ export class SceneRenderer {
         0.2,
       );
       this.objectGroup.add(s);
+      this.labels.push({ sprite: s, kind: 'function', pinned: !!obj.labelOffset });
     }
   }
 
@@ -1524,6 +1707,7 @@ export class SceneRenderer {
         0.3,
       );
       this.objectGroup.add(s);
+      this.labels.push({ sprite: s, kind: 'curve', pinned: !!obj.labelOffset });
     }
   }
 

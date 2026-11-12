@@ -2229,3 +2229,337 @@ body.vs-fs-lock {
   opacity: 0.5;
   cursor: default;
 }
+
+/* ---------------------------------------------------------------
+ * 投屏模式（presentation）
+ *
+ * 讲台场景的三个硬需求：图大、字大、一只手能翻步。
+ * 实现上只切 body.present 一个 class，不重建任何组件——
+ * 画布尺寸变化由两个渲染器各自的 ResizeObserver 处理。
+ * --------------------------------------------------------------- */
+.present-btn {
+  flex: none;
+  margin-top: 0 !important;
+  border-radius: 999px;
+  padding: 7px 14px;
+  background: #fff;
+  border: 1px solid var(--border-strong);
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: var(--shadow-sm);
+}
+.present-btn:hover {
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+/* 底部步骤条：浮在图上的一条窄胶囊，不抢图形 */
+#present-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(760px, calc(100% - 32px));
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(8px);
+}
+#present-bar[hidden] {
+  display: none;
+}
+.pb-btn {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: #fff;
+  color: var(--text);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  font-family: inherit;
+}
+.pb-btn:hover:not(:disabled) {
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+.pb-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.pb-mid {
+  min-width: 0;
+  text-align: center;
+}
+.pb-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 440px;
+}
+.pb-pos {
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.pb-exit {
+  flex: none;
+  border: 1px solid var(--border-strong);
+  background: #fff;
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.pb-exit:hover {
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+/* 投屏态：右侧只留「参数 + 分步讲解」，其余面板整体让位 */
+body.present #panel {
+  width: 400px;
+  padding-right: 12px;
+}
+body.present #panel > section:not(#params-panel):not(#step-panel),
+body.present #panel > details {
+  display: none;
+}
+body.present #topbar,
+body.present #notebook,
+body.present .kp-tab,
+body.present .kp-drawer,
+body.present .chat-bubble,
+body.present .chat-panel,
+body.present .vf-chip,
+body.present .vf-pop {
+  display: none !important;
+}
+
+/* 字号：按 1024×768 投影的观看距离定，13px 在后排看不清 */
+body.present #panel section h3 {
+  font-size: 15px;
+}
+body.present #step-nav .btn {
+  font-size: 15px;
+  padding: 9px 14px;
+}
+body.present #step-pos {
+  font-size: 13px;
+}
+body.present #step-body h4 {
+  font-size: 24px;
+  line-height: 1.4;
+  margin: 0 0 12px;
+}
+body.present #step-text {
+  font-size: 18px;
+  line-height: 1.85;
+}
+body.present #step-text .katex {
+  font-size: 1.12em;
+}
+body.present #step-text .katex-display {
+  margin: 14px 0;
+}
+body.present #params label {
+  font-size: 14px;
+}
+
+/* ---------------------------------------------------------------
+ * 核验清单（画布左上角）
+ * 体检只在失败时说话，成功了什么都不显示——老师因此没有证据
+ * 判断「这张图被验过」。这枚胶囊补的就是这份证据。
+ * --------------------------------------------------------------- */
+.vf-chip {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  z-index: 9;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(6px);
+}
+.vf-chip[hidden] {
+  display: none;
+}
+.vf-chip[data-state='pass'] {
+  border-color: #b7e3c8;
+  background: #f2fbf6;
+  color: var(--ok);
+}
+.vf-chip[data-state='fail'] {
+  border-color: #f3b8b3;
+  background: #fef4f3;
+  color: var(--danger);
+}
+.vf-chip[data-state='empty'],
+.vf-chip[data-state='tainted'] {
+  border-color: #f1d3ac;
+  background: #fffaf2;
+  color: var(--warn);
+}
+.vf-chip:hover {
+  box-shadow: var(--shadow-md);
+}
+.vf-mark {
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.vf-pop {
+  position: absolute;
+  left: 14px;
+  top: 48px;
+  z-index: 20;
+  width: 330px;
+  max-width: calc(100% - 28px);
+  max-height: min(420px, calc(100% - 80px));
+  overflow-y: auto;
+  padding: 10px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border-strong);
+  background: #fff;
+  box-shadow: var(--shadow-md);
+}
+.vf-pop[hidden] {
+  display: none;
+}
+.vf-pop-head {
+  margin: 0 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.vf-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.vf-item {
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  gap: 0 6px;
+  align-items: baseline;
+  padding: 5px 6px;
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  color: var(--text);
+}
+.vf-item:hover {
+  background: var(--panel-2);
+}
+.vf-item[data-ok='false'] {
+  background: #fef4f3;
+}
+.vf-item-mark {
+  font-weight: 700;
+}
+.vf-item[data-ok='true'] .vf-item-mark {
+  color: var(--ok);
+}
+.vf-item[data-ok='false'] .vf-item-mark {
+  color: var(--danger);
+}
+.vf-desc {
+  overflow-wrap: anywhere;
+}
+.vf-why {
+  grid-column: 2;
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+.vf-none {
+  padding: 2px 6px 4px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text-2);
+}
+.vf-foot {
+  margin-top: 8px;
+  padding: 8px 8px 2px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+/* 推导板书占满整个舞台、顶部就是说明条：核验胶囊让位 */
+#stage:has(#derive-board:not([hidden])) .vf-chip,
+#stage:has(#derive-board:not([hidden])) .vf-pop {
+  display: none;
+}
+
+/* 没有可调参数时整块收起（投屏模式会主动加 hidden） */
+#params-panel[hidden] {
+  display: none;
+}
+
+/* ---------------------------------------------------------------
+ * 学习面板搬进视频工作台（.in-video）
+ *
+ * 主画布上抽屉靠 flex 让位、聊天面板是舞台的纵向兄弟；视频里没有
+ * 这套布局，改成绝对定位浮在 16:9 画布上（auto-pause 保证挡住字幕
+ * 时讲解已经停了）。同一组 DOM 搬来搬去，靠这个类切换两套定位。
+ * --------------------------------------------------------------- */
+#vs-stage .kp-drawer.in-video {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+}
+#vs-stage .kp-drawer.in-video[data-open='true'] {
+  box-shadow: -10px 0 26px rgba(15, 23, 42, 0.16);
+}
+#vs-stage .chat-panel.in-video {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  box-shadow: 0 -8px 24px rgba(15, 23, 42, 0.14);
+}
+#vs-stage .chat-bubble.in-video {
+  z-index: 41;
+}
+
+/* 视频里的聊天面板：知识点抽屉展开时让出右缘，别把关闭按钮压在抽屉下面 */
+#vs-stage:has(.kp-drawer.in-video[data-open='true']) .chat-panel.in-video {
+  right: 322px;
+}
+
+/* 头部两个元素都写了 margin-left:auto，会把「清空」挤到面板正中（面板越宽越明显）。
+   只让关闭按钮吃剩余空间，「清空」紧跟其左。主画布同样受益。 */
+.chat-head .kp-icon {
+  margin-left: 0;
+}

@@ -21,6 +21,7 @@ import {
   type KnowledgePoint,
 } from '../llm/knowledge';
 import { buildFactSheet } from '../llm/factSheet';
+import { hasLlmKey } from '../llm/stub';
 
 type AnyScene = Scene | Scene3D;
 
@@ -40,6 +41,13 @@ export interface KnowledgePanelApi {
   close(): void;
   toggle(): void;
   isOpen(): boolean;
+  /**
+   * 搬到别的宿主（视频工作台）。同一组 DOM 搬家，不复制——
+   * 知识点缓存（state.keys）天然共享，同一道题不会调两次模型。
+   */
+  moveTo(host: HTMLElement): void;
+  /** 搬回挂载时的原位 */
+  moveBack(): void;
 }
 
 interface State {
@@ -49,6 +57,8 @@ interface State {
   points: KnowledgePoint[];
   note: string;
   error: string;
+  /** 没有 error 也允许重试（例如"还没填 Key"——填完该能再点一次） */
+  canRetry: boolean;
 }
 
 export function mountKnowledgePanel(
@@ -62,6 +72,7 @@ export function mountKnowledgePanel(
     points: [],
     note: '',
     error: '',
+    canRetry: false,
   };
   /** 场景切换令牌：异步回来时场景已经换了，就丢掉结果 */
   let token = 0;
@@ -110,6 +121,8 @@ export function mountKnowledgePanel(
   panel.append(head, list, foot);
   drawer.append(tab, panel);
   container.appendChild(drawer);
+  /** 原始宿主：moveBack 要回这里 */
+  const home = container;
 
   // ---------------- 渲染 ----------------
   function setOpen(on: boolean) {
@@ -189,7 +202,7 @@ export function mountKnowledgePanel(
       note.textContent = state.note;
       foot.appendChild(note);
     }
-    if (state.error) {
+    if (state.error || state.canRetry) {
       const retry = document.createElement('button');
       retry.type = 'button';
       retry.className = 'btn';
@@ -217,6 +230,7 @@ export function mountKnowledgePanel(
     const key = knowledgeKey(problem, scene);
     state.currentKey = key;
     state.error = '';
+    state.canRetry = false;
 
     const cached = state.keys.get(key);
     if (cached && !force) {
@@ -231,6 +245,18 @@ export function mountKnowledgePanel(
     if (!problem.trim()) {
       state.points = fallback;
       state.note = '演示场景没有题面，这里是从图上条件反推的知识点。';
+      paint();
+      return;
+    }
+
+    // 没填 Key：那次请求注定失败，别发。
+    // 发出去的结果是学生第一眼看到一段红字"还没有填 API Key"——
+    // 他会以为产品坏了，而不是"我还没配置"。所以这里静默给反推条目，
+    // 页脚留一个「重新整理」，填完 Key 直接点一下就能取到完整知识点。
+    if (!hasLlmKey()) {
+      state.points = fallback;
+      state.note = '上面是从图上条件反推的条目。填好 API Key 后点「重新整理」，可以取到含公式与用法的完整知识点。';
+      state.canRetry = true;
       paint();
       return;
     }
@@ -282,6 +308,14 @@ export function mountKnowledgePanel(
     close: () => setOpen(false),
     toggle: () => setOpen(drawer.dataset.open !== 'true'),
     isOpen: () => drawer.dataset.open === 'true',
+    moveTo(host) {
+      drawer.classList.add('in-video');
+      host.appendChild(drawer);
+    },
+    moveBack() {
+      drawer.classList.remove('in-video');
+      home.appendChild(drawer);
+    },
   };
 }
 

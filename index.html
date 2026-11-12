@@ -20,6 +20,10 @@
           <button class="btn notebook-btn" id="notebook-btn">
             我的题本 <span class="nb-badge" id="nb-badge" hidden>0</span>
           </button>
+          <!-- 投屏模式：讲台上只用图 + 步骤，字要大、控件要少 -->
+          <button class="btn present-btn" id="present-btn" title="投屏模式：大字号、方向键翻步、Esc 退出">
+            投屏
+          </button>
         </div>
       </header>
       <main>
@@ -32,6 +36,17 @@
                知识抽屉是它的兄弟节点——抽屉展开时舞台变窄，图跟着重排，
                不会被盖住（立体图右上角常有顶点） -->
           <div id="stage">
+          <!-- 投屏模式底部步骤条：平时隐藏，body.present 时才出现。
+               放在画布内层，是为了让它跟着画布区域居中，而不是跟着整页 -->
+          <div id="present-bar" hidden>
+            <button class="pb-btn" id="pb-prev" title="上一步（←）">‹</button>
+            <div class="pb-mid">
+              <div class="pb-title" id="pb-title"></div>
+              <div class="pb-pos" id="pb-pos"></div>
+            </div>
+            <button class="pb-btn" id="pb-next" title="下一步（→）">›</button>
+            <button class="pb-exit" id="pb-exit" title="退出投屏（Esc）">退出</button>
+          </div>
           <!-- 推导模式：没有可对应图形的题（纯代数/不等式/参数范围）不画图，
                改排推导板书。顶部那行小字说明"为什么没有图"，避免被当成故障 -->
           <div id="derive-board" hidden>
@@ -62,7 +77,7 @@
         <aside id="panel">
           <section id="scene-info"></section>
 
-          <section>
+          <section id="params-panel">
             <h3>参数（拖动画布中的点也可以改）</h3>
             <div id="params"></div>
           </section>

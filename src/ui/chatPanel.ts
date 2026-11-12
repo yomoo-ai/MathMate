@@ -31,6 +31,8 @@ export interface ChatPanelOpts {
   getContext: () => ChatContext;
   /** 执行联动（undo=true 表示撤销高亮） */
   onAction: (act: ChatAction, undo: boolean) => void;
+  /** 面板被打开时通知外部（视频工作台借此暂停播放） */
+  onOpen?: () => void;
 }
 
 export interface ChatPanelApi {
@@ -38,6 +40,14 @@ export interface ChatPanelApi {
   reset(): void;
   open(): void;
   close(): void;
+  isOpen(): boolean;
+  /**
+   * 搬到别的宿主（视频工作台）。是**同一组 DOM**在搬家，不是复制——
+   * 聊天历史、正在进行的流式回答都还在，主画布和视频里看到的是同一场对话。
+   */
+  moveTo(mount: HTMLElement, bubbleHost: HTMLElement): void;
+  /** 搬回挂载时的原位 */
+  moveBack(): void;
 }
 
 const QUICK = ['这一步为什么要这么做', '用到的定理是什么', '还有别的解法吗'];
@@ -47,6 +57,9 @@ export function mountChatPanel(opts: ChatPanelOpts): ChatPanelApi {
   let turns = 0;
   let busy = false;
   let abort: AbortController | null = null;
+  /** 原始宿主：moveBack 要回这里 */
+  const homeMount = opts.mount;
+  const homeBubbleHost = opts.bubbleHost;
 
   // ---------------- DOM ----------------
   const bubble = document.createElement('button');
@@ -115,6 +128,7 @@ export function mountChatPanel(opts: ChatPanelOpts): ChatPanelApi {
     // 所以收起时清掉内联值，让抽屉真的能缩回去
     if (!on) panel.style.height = '';
     if (on) {
+      opts.onOpen?.();
       // 打开时滚到最新，并把焦点给输入框（但手机上别弹键盘，用 media query 判断成本高，先只 focus 桌面）
       list.scrollTop = list.scrollHeight;
       if (window.matchMedia('(min-width: 900px)').matches) input.focus();
@@ -359,5 +373,25 @@ export function mountChatPanel(opts: ChatPanelOpts): ChatPanelApi {
     },
     open: () => setOpen(true),
     close: () => setOpen(false),
+    isOpen: () => panel.dataset.open === 'true',
+    moveTo(mount, bubbleHost) {
+      panel.classList.add('in-video');
+      bubble.classList.add('in-video');
+      mount.append(panel);
+      bubbleHost.append(bubble);
+      // opts 里的宿主也要换：拖动改高度、开关面板都用它
+      opts.mount = mount;
+      opts.bubbleHost = bubbleHost;
+    },
+    moveBack() {
+      panel.classList.remove('in-video');
+      bubble.classList.remove('in-video');
+      // 视频里可能拖过高度，内联 px 搬回主画布会按旧像素卡住
+      panel.style.height = '';
+      homeMount.append(panel);
+      homeBubbleHost.append(bubble);
+      opts.mount = homeMount;
+      opts.bubbleHost = homeBubbleHost;
+    },
   };
 }

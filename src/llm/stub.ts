@@ -132,6 +132,17 @@ function getVlKey(): string {
     .trim();
 }
 
+/**
+ * 有没有可用的对话 Key。
+ *
+ * 给「不调模型也能给个像样结果」的地方用（目前是知识点抽屉）：
+ * 没填 Key 时直接走本地兜底，别先发一次注定失败的请求再显示红字——
+ * 学生第一次打开看到"错误"，会以为产品坏了，而不是"我还没填 Key"。
+ */
+export function hasLlmKey(): boolean {
+  return getApiKey().length > 0;
+}
+
 // ---------------------------------------------------------------
 // 场景「内核」：把一个场景类型与流水线的差异点集中成一个小对象
 //
@@ -269,6 +280,9 @@ async function fetchWithRetry(
     try {
       res = await fetch(url, init);
     } catch (err) {
+      // 主动取消不是故障：立刻向上抛，不重试。
+      // 用户已经换题了，还在这里退避重试等于替一个没人要的结果继续烧调用。
+      if ((err as Error | undefined)?.name === 'AbortError') throw err;
       // fetch 本身抛异常（断网、代理拦了）——也可能是暂时的
       lastError = err as Error;
       if (i === tries) break;
@@ -619,6 +633,7 @@ function extractJson(text: string): string {
 export async function callChat(
   messages: Array<{ role: string; content: string }>,
   onProgress?: ProgressFn,
+  signal?: AbortSignal,
 ): Promise<string> {
   const key = getApiKey();
   if (!key) {
@@ -645,6 +660,7 @@ export async function callChat(
         // 从根上消灭"多一句解释、包一层 markdown 围栏"这类事故
         response_format: { type: 'json_object' },
       }),
+      signal,
     },
     'DeepSeek',
     onProgress,
@@ -773,6 +789,7 @@ async function runGeneration<T>(
   prompt: string,
   onProgress?: ProgressFn,
   onIssues?: IssuesFn,
+  signal?: AbortSignal,
 ): Promise<T> {
   if (!getApiKey()) {
     throw new Error(
@@ -852,12 +869,15 @@ async function runGeneration<T>(
   };
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // 用户换题/改描述了：这条链路已经没人要，立刻收手。
+    // 放在每轮开头而不是只在 fetch 里判，是因为两轮之间还有复核在跑。
+    if (signal?.aborted) throw new DOMException('已取消', 'AbortError');
     onProgress?.(
       attempt === 1
         ? `→ 正在调用模型（${kernel.label}场景）……`
         : `→ 第 ${attempt} 次尝试（已回传错误重试）……`,
     );
-    const text = await callChat(messages, onProgress);
+    const text = await callChat(messages, onProgress, signal);
     const json = extractJson(text);
     const result = kernel.parse(json);
 
@@ -999,8 +1019,9 @@ export async function requestSceneFromPrompt(
   prompt: string,
   onProgress?: ProgressFn,
   onIssues?: IssuesFn,
+  signal?: AbortSignal,
 ): Promise<Scene> {
-  return runGeneration(KERNEL_2D, prompt, onProgress, onIssues);
+  return runGeneration(KERNEL_2D, prompt, onProgress, onIssues, signal);
 }
 
 /** 主入口（立体几何）：自然语言 → Scene3D */
@@ -1008,6 +1029,7 @@ export async function requestSceneFromPrompt3D(
   prompt: string,
   onProgress?: ProgressFn,
   onIssues?: IssuesFn,
+  signal?: AbortSignal,
 ): Promise<Scene3D> {
-  return runGeneration(KERNEL_3D, prompt, onProgress, onIssues);
+  return runGeneration(KERNEL_3D, prompt, onProgress, onIssues, signal);
 }

@@ -29,11 +29,12 @@ import type { Narration } from '../llm/narration';
 import { resolveScene3D } from '../protocol/resolve3d';
 import { sanitizeAction, stripActStream } from '../llm/actProtocol';
 import { splitReply } from '../llm/chatAgent';
-import { normalizeKnowledge, fallbackKnowledge } from '../llm/knowledge';
+import { normalizeKnowledge, fallbackKnowledge, knowledgeKey } from '../llm/knowledge';
 import { buildFactSheet } from '../llm/factSheet';
 import { evalVec3 } from '../protocol/expr';
 import type { Point3Object, Scene3D, Scene3DObject, Vec3 } from '../protocol/scene3d';
 import { CASES, CASES_3D, RENDER_CASES, type TestCase, type TestCase3D } from './cases';
+import { runE2ESamples } from './e2eSamples';
 import { FEW_SHOT_EXAMPLE, CYLINDER_EXAMPLE } from '../llm/prompt3d';
 
 export interface RowResult {
@@ -203,8 +204,26 @@ function runOne(c: TestCase | TestCase3D, space: '2d' | '3d' = '2d'): RowResult 
   return { ...base, ok: true, detail: rd ? `全部通过（${rd}）` : '全部通过' };
 }
 
-export function runAll(): Report {
-  const rows = [
+/**
+ * 整题回放：把一整道题的完整产物（题面 + 场景 + 分步 + 读数）跑一遍全链路。
+ *
+ * 与上面那些分组用例的区别：那些是"一条规则一个样本"，
+ * 这里是"一道题从生到死"。单点全绿也可能拼起来就散（步骤点了不存在的点、
+ * 读数求值退化成 NaN），这类问题只有整题跑才暴露。
+ */
+function runE2ECases(): RowResult[] {
+  return runE2ESamples().map((r) => ({
+    name: `整题回放：${r.name}`,
+    why:
+      '单点用例全过，也不代表拼成一道完整的题还立得住：这条同时压格式关、体检关、' +
+      '步骤点名和读数求值，任何一环退化都会红',
+    gate: '综合',
+    ok: r.ok,
+    detail: r.detail,
+  }));
+}
+
+export function runAll(): Report {  const rows = [
     ...CASES.map((c) => runOne(c, '2d')),
     ...CASES_3D.map((c) => runOne(c, '3d')),
     ...runPromptCases(),
@@ -216,6 +235,7 @@ export function runAll(): Report {
     ...runJsonRepairCases(),
     ...runLearningCases(),
     ...runRenderCases(),
+    ...runE2ECases(),
   ];
   const skipped = rows.filter((r) => r.skipped).length;
   const passed = rows.filter((r) => r.ok && !r.skipped).length;
@@ -1084,6 +1104,32 @@ function runLearningCases(): RowResult[] {
     );
   }
 
+  // ⑪ 知识点缓存键不串题：同标题、同规模、题面开头一模一样
+  {
+    const mkScene = (ids: string[]): Scene3D =>
+      ({
+        space: '3d' as const,
+        meta: { title: '正方体' },
+        params: [],
+        objects: ids.map((id) => ({ id, type: 'point3' as const, at: [0, 0, 0] })),
+        constraints: [],
+      }) as Scene3D;
+    const head = '如图，在正方体 ABCD-A1B1C1D1 中，E 为棱 AB 的中点，';
+    const k1 = knowledgeKey(`${head}求二面角 E-CD-A 的大小。`, mkScene(['A', 'B', 'C']));
+    const k2 = knowledgeKey(`${head}求异面直线 A1B 与 AD1 所成角。`, mkScene(['A', 'B', 'C']));
+    const k3 = knowledgeKey(`${head}求二面角 E-CD-A 的大小。`, mkScene(['A', 'B', 'D']));
+    const same = knowledgeKey(`${head}求二面角 E-CD-A 的大小。`, mkScene(['A', 'B', 'C']));
+    const ok = k1 !== k2 && k1 !== k3 && k1 === same;
+    rows.push(
+      mk(
+        '知识点缓存键：同标题同规模的两道题不串',
+        '旧键只取题面前 160 字 + 对象个数，一天讲五道"正方体"时抽屉会显示上一道题的知识点',
+        ok,
+        `${k1} / ${k2} / ${k3}`,
+      ),
+    );
+  }
+
   return rows;
 }
 
@@ -1189,6 +1235,80 @@ function runRenderCases(): RowResult[] {
         ...meta,
         ok: true,
         detail: `视野 [${v.xMin.toFixed(1)}, ${v.xMax.toFixed(1)}] × [${v.yMin.toFixed(1)}, ${v.yMax.toFixed(1)}]`,
+      });
+    }
+  }
+
+  // 标签避让：这个场景把三种冲突叠在一起——
+  // ① E/F 两个点几乎重合，两个点标签必然叠成一团；
+  // ② BC 的 from→to 让法线朝下，旧代码里标签会掉进 x 轴刻度带；
+  // ③ AC 是竖边，法线朝左会压住 y 轴刻度。
+  // 断言只有一条：任意两个标签的包围盒不相交。
+  {
+    const parsedLabel = parseScene(
+      JSON.stringify({
+        meta: { title: '标签避让' },
+        view: { xMin: -1.5, xMax: 17, yMin: -1.6, yMax: 9.4 },
+        params: [],
+        objects: [
+          { type: 'point', id: 'A', at: [0, 8.6], label: 'A' },
+          { type: 'point', id: 'C', at: [0, 0], label: 'C' },
+          { type: 'point', id: 'B', at: [16, 0], label: 'B' },
+          { type: 'point', id: 'D', at: [5, 0], label: 'D' },
+          { type: 'point', id: 'E', at: [4, 2], label: 'E' },
+          { type: 'point', id: 'F', at: [4.25, 2.1], label: 'F' },
+          { type: 'segment', id: 'ACs', from: [0, 0], to: [0, 8.6], label: 'AC' },
+          { type: 'segment', id: 'BCs', from: [16, 0], to: [5, 0], label: 'BC' },
+          { type: 'segment', id: 'ADs', from: [0, 8.6], to: [5, 0], label: 'AD' },
+        ],
+        constraints: [],
+        steps: [],
+        readouts: [],
+      }),
+    );
+    if (!parsedLabel.ok) {
+      base.push({
+        name: '标签避让：靠得近的点 / 朝下的边 / 贴轴的边，字母不叠',
+        why: '各标签各按各的局部规则摆，两个点一靠近就叠成一团，线段法线翻到下面还会压住坐标轴刻度',
+        gate: '渲染关',
+        ok: false,
+        detail: '这个测试场景本身写错了（解析失败）',
+        actualText: parsedLabel.errors.join('\n'),
+      });
+    } else {
+      engine.setScene(parsedLabel.scene, {});
+      type SpriteRec = {
+        sprite: { position: { x: number; y: number }; scale: { x: number; y: number } };
+      };
+      const recs = (engine as unknown as { labels: SpriteRec[] }).labels;
+      const boxes = recs.map((r) => {
+        // 取 86% 的盒子：贴图自带内边距，全算上会把"擦边"误判成重叠
+        const hw = r.sprite.scale.x * 0.43;
+        const hh = r.sprite.scale.y * 0.43;
+        return {
+          x0: r.sprite.position.x - hw,
+          x1: r.sprite.position.x + hw,
+          y0: r.sprite.position.y - hh,
+          y1: r.sprite.position.y + hh,
+        };
+      });
+      const clashes: string[] = [];
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i];
+          const b = boxes[j];
+          if (a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0) {
+            clashes.push(`${i}-${j}`);
+          }
+        }
+      }
+      base.push({
+        name: '标签避让：靠得近的点 / 朝下的边 / 贴轴的边，字母不叠',
+        why: '各标签各按各的局部规则摆，两个点一靠近就叠成一团，线段法线翻到下面还会压住坐标轴刻度',
+        gate: '渲染关',
+        ok: recs.length >= 7 && clashes.length === 0,
+        detail: `共 ${recs.length} 个标签，${clashes.length} 对重叠`,
+        actualText: clashes.length > 0 ? `重叠的序号对：${clashes.join(', ')}` : undefined,
       });
     }
   }
