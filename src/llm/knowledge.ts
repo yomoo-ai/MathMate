@@ -19,6 +19,7 @@ import type { FactSheet } from './factSheet';
 import type { Scene } from '../protocol/scene';
 import type { Scene3D } from '../protocol/scene3d';
 import { normalizeMathInput } from '../ui/mathText';
+import { CHAPTERS, normalizeChapter } from './chapters';
 
 export interface KnowledgePoint {
   /** 定理 / 概念名，≤ 16 字 */
@@ -171,7 +172,10 @@ function systemPrompt(): string {
 - 结论必须与给出的「已核验的几何条件」一致。条件里没有的关系，不许当已知；
 - 不要编造题里没有的点、数值或结论。
 
-只输出 JSON：{"points":[{"name":"","formula":"","use":"","pitfall":""}]}`;
+另外给出本题所属章节：chapter 字段，只能从下面这些里**原样选一个**（都不像就写空字符串）：
+${CHAPTERS.join(' / ')}
+
+只输出 JSON：{"chapter":"","points":[{"name":"","formula":"","use":"","pitfall":""}]}`;
 }
 
 function userPrompt(problem: string, facts: string, stepTitles: string[]): string {
@@ -190,6 +194,25 @@ function userPrompt(problem: string, facts: string, stepTitles: string[]): strin
 }
 
 /**
+ * 从模型原始输出里提取章节。模型可能给对象、也可能给裸数组（只关心知识点），
+ * 裸数组就是没有章节。normalizeChapter 负责白名单校验。
+ */
+function chapterOf(raw: unknown): string {
+  let obj: unknown = raw;
+  if (typeof obj === 'string') {
+    try {
+      obj = JSON.parse(obj);
+    } catch {
+      return '';
+    }
+  }
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+    return normalizeChapter((obj as { chapter?: unknown }).chapter);
+  }
+  return '';
+}
+
+/**
  * 拉取知识点。失败抛错，由 UI 决定显示重试还是兜底。
  * 注意：调用方应先展示 skeleton，不要 await 到黑屏。
  */
@@ -197,14 +220,14 @@ export async function requestKnowledge(
   problem: string,
   facts: FactSheet,
   stepTitles: string[],
-): Promise<KnowledgePoint[]> {
+): Promise<{ points: KnowledgePoint[]; chapter: string }> {
   const raw = await callChat([
     { role: 'system', content: systemPrompt() },
     { role: 'user', content: userPrompt(problem, facts.text, stepTitles) },
   ]);
   const points = normalizeKnowledge(raw);
   if (points.length === 0) throw new Error('模型没有给出可用的知识点');
-  return points;
+  return { points, chapter: chapterOf(raw) };
 }
 
 /** FNV-1a 32 位：够短、够散，只为把长题面和 id 序列压成稳定的短串 */

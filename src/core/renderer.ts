@@ -218,10 +218,15 @@ export class SceneRenderer {
     if (this.currentScene) this.rebuild();
   }
 
-  constructor(container: HTMLElement) {
+  constructor(container: HTMLElement, opts?: { preserveDrawingBuffer?: boolean }) {
     this.container = container;
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    // preserveDrawingBuffer：组卷导出时要在渲染后把画布转成图片。
+    // 默认关着（省显存）；截图实例显式打开，否则 toDataURL 拿到的是空图。
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      preserveDrawingBuffer: opts?.preserveDrawingBuffer ?? false,
+    });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     container.appendChild(this.renderer.domElement);
 
@@ -237,23 +242,51 @@ export class SceneRenderer {
     el.addEventListener('pointermove', (e) => this.onPointerMove(e));
     el.addEventListener('pointerup', () => this.endDrag());
     el.addEventListener('pointercancel', () => this.endDrag());
-    window.addEventListener('resize', () => this.onResize());
+    window.addEventListener('resize', this.onWinResize);
     // 容器自身也会变宽变窄（右侧知识点抽屉展开时舞台让步）。
     // 只监听 window 的话，那种情况下画布尺寸不更新，图会被压扁或裁掉一角。
     // 用尾延迟防抖：抽屉有 0.22s 的过渡动画，每帧重建一次太浪费——
     // 等宽度稳定下来再量一次就够。
     if (typeof ResizeObserver !== 'undefined') {
-      const ro = new ResizeObserver(() => {
+      this.ro = new ResizeObserver(() => {
         if (this.resizeTimer) clearTimeout(this.resizeTimer);
         this.resizeTimer = window.setTimeout(() => {
           this.resizeTimer = 0;
           this.onResize();
         }, 90);
       });
-      ro.observe(container);
+      this.ro.observe(container);
     }
 
     this.onResize();
+  }
+
+  private onWinResize = () => this.onResize();
+  private ro: ResizeObserver | null = null;
+
+  /**
+   * 销毁离屏实例（组卷截图用完即弃）。
+   * WebGL context 不释放的话，浏览器一般只允许页面同时存在 ~16 个，
+   * 连续给十几道题截图就会撞上限——之后所有 canvas 全变黑。
+   */
+  dispose() {
+    if (this.ro) this.ro.disconnect();
+    if (this.resizeTimer) clearTimeout(this.resizeTimer);
+    window.removeEventListener('resize', this.onWinResize);
+    this.renderer.dispose();
+    this.renderer.forceContextLoss();
+    this.renderer.domElement.remove();
+  }
+
+  /**
+   * 把当前画面导出成图片（组卷/讲义用）。
+   * 只对 preserveDrawingBuffer:true 的实例有效（截图实例才会开）。
+   * 先同步 render 一次再读像素，避免读到被清空的 buffer。
+   */
+  domToDataURL(w: number, h: number): string {
+    this.renderer.setSize(w, h, false);
+    this.renderer.render(this.scene, this.camera);
+    return this.renderer.domElement.toDataURL('image/jpeg', 0.9);
   }
 
   /** 设置场景（纯数据）与当前参数值，并重绘画布 */

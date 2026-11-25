@@ -65,9 +65,17 @@
               <span class="nb-count" id="nb-count"></span>
               <button class="nb-icon-btn" data-action="close" title="收起">×</button>
             </div>
+            <div class="nb-filter" id="nb-filter"></div>
             <div class="nb-list" id="nb-list"></div>
+            <div class="nb-select-bar" id="nb-select-bar" hidden>
+              <span id="nb-select-count">已选 0 题</span>
+              <button class="btn nb-paper-btn" data-action="paper">生成试卷</button>
+              <button class="btn" data-action="deselect">取消选择</button>
+            </div>
             <div class="nb-foot">
-              <span class="nb-hint">只存在这台电脑的浏览器里</span>
+              <span class="nb-hint" title="题本只存在这台电脑的浏览器里，建议定期点「备份」导出 JSON">仅存本机 · 记得备份</span>
+              <button class="btn" data-action="import" title="从 JSON 备份导入">导入</button>
+              <button class="btn" data-action="export" title="下载题本 JSON 备份">备份</button>
               <button class="btn" data-action="clear">清空</button>
             </div>
           </div>

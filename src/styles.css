@@ -1081,21 +1081,380 @@ select {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   padding: 10px 14px;
   border-top: 1px solid var(--border);
   background: #fafbfd;
 }
 
 .nb-hint {
+  flex: 1;
+  min-width: 0;
   font-size: 10.5px;
   color: var(--text-3);
+  /* 允许收缩截断：三个按钮不能被这行说明挤到竖排 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nb-foot .btn {
   margin-top: 0;
   padding: 3px 11px;
   font-size: 11.5px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* ---- 题本：章节筛选 / 勾选 / 组卷 ---- */
+
+.nb-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.nb-chip {
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.nb-chip:hover {
+  border-color: var(--accent-line);
+  color: var(--text);
+}
+
+.nb-chip.active {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* 条目改成「勾选框 + 内容」两栏 */
+.nb-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.nb-check {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  margin: 3px 0 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.nb-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.nb-actions {
+  align-items: center;
+}
+
+.nb-chap {
+  font-size: 11px;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 2px 4px;
+  max-width: 110px;
+  cursor: pointer;
+}
+
+/* 底部选中条：勾了题才出现。
+   注意 [hidden] 必须显式写成 display:none——下面的 display:flex 会盖掉
+   浏览器的 `[hidden]{display:none}`（nb-badge 也踩过同一个坑） */
+.nb-select-bar[hidden] {
+  display: none;
+}
+
+.nb-select-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--accent-soft);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.nb-select-bar .btn {
+  margin-top: 0;
+  padding: 3px 12px;
+  font-size: 11.5px;
+}
+
+.nb-paper-btn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.nb-paper-btn:hover:not(:disabled) {
+  background: var(--accent-2);
+}
+
+.nb-select-bar .btn:not(.nb-paper-btn) {
+  margin-left: auto;
+}
+
+/* ---- 组卷预览（覆盖层 + 打印版式） ---- */
+
+.paper-root {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  background: #eef1f6;
+  display: flex;
+  flex-direction: column;
+}
+
+.paper-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: #fff;
+  border-bottom: 1px solid var(--border-strong);
+  box-shadow: 0 1px 6px rgb(0 0 0 / 6%);
+}
+
+#paper-title {
+  font-size: 15px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  width: 280px;
+  color: var(--text);
+}
+
+.paper-teacher {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.paper-count {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-left: auto;
+}
+
+.paper-toolbar .btn {
+  margin-top: 0;
+  white-space: nowrap;
+}
+
+#paper-print {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+#paper-print:hover {
+  background: var(--accent-2);
+}
+
+.paper-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 12px 48px;
+}
+
+/* 试卷纸：A4 比例的白色画布 */
+.paper-page {
+  max-width: 760px;
+  margin: 0 auto;
+  background: #fff;
+  border-radius: 4px;
+  box-shadow: 0 2px 14px rgb(0 0 0 / 10%);
+  padding: 44px 52px;
+}
+
+.paper-head {
+  text-align: center;
+  border-bottom: 2px solid var(--text);
+  padding-bottom: 12px;
+  margin-bottom: 18px;
+}
+
+.paper-head h1 {
+  margin: 0 0 10px;
+  font-size: 22px;
+  letter-spacing: 2px;
+}
+
+.paper-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px 16px;
+  /* 打印时版心变窄，左右两段允许折行，避免日期被裁到纸外 */
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.paper-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 4px;
+}
+
+.paper-item + .paper-item {
+  border-top: 1px dashed var(--border);
+}
+
+.paper-q {
+  flex: 1;
+  min-width: 0;
+}
+
+.paper-q-text {
+  font-size: 13.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+/* 转录稿的段标题（已知/求）印成正式小标签——原来连着【图形结构】
+   那些模型自述一起平铺在卷面上，看起来像程序日志 */
+.paper-sec {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.paper-img {
+  display: block;
+  /* 640×400 的截图在 A4 版心里占满会挤掉半页，收到 62% ≈ 400px 宽，
+     一页能放下两题，打印出来也远比 640px 清楚（A4 300dpi 有余量） */
+  max-width: 62%;
+  margin: 10px auto 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.paper-img-missing {
+  color: var(--text-3);
+  font-size: 11.5px;
+  text-align: center;
+  padding: 14px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  margin-top: 10px;
+}
+
+.paper-steps {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fbfcfe;
+  padding: 10px 14px;
+}
+
+.paper-steps-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+
+.paper-step {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+/* 注意：这里不能用裸 `span` 选择器——KaTeX 把公式拆成几十个 <span>，
+   设成 display:block 会把每个字母排成一行（踩过）。用专用类包一层 */
+.paper-step-body {
+  color: var(--text-2);
+}
+
+.paper-item-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.paper-item-tools .btn {
+  margin-top: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.paper-empty {
+  text-align: center;
+  color: var(--text-3);
+  padding: 40px;
+  font-size: 13px;
+}
+
+/* ---- 打印：只出试卷纸本身 ---- */
+@media print {
+  @page {
+    size: A4;
+    margin: 14mm 16mm;
+  }
+
+  /* 组卷开着时：除试卷纸全部隐藏（含工具栏） */
+  body.paper-open > *:not(.paper-root) {
+    display: none !important;
+  }
+
+  body.paper-open .paper-root {
+    position: static;
+    background: #fff;
+  }
+
+  body.paper-open .no-print,
+  body.paper-open .paper-toolbar,
+  body.paper-open .paper-item-tools {
+    display: none !important;
+  }
+
+  body.paper-open .paper-scroll {
+    overflow: visible;
+    padding: 0;
+  }
+
+  body.paper-open .paper-page {
+    max-width: none;
+    margin: 0;
+    padding: 0;
+    box-shadow: none;
+    border-radius: 0;
+  }
+
+  body.paper-open .paper-item {
+    break-inside: avoid;
+  }
+
+  body.paper-open .paper-img {
+    max-width: 80%;
+  }
 }
 
 /* ---------- LLM 面板：平面 / 立体 模式开关 ---------- */

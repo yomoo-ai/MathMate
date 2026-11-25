@@ -41,11 +41,15 @@ import {
   mountNotebook,
   loadEntries,
   saveEntry,
+  setChapter,
+  autoFillChapter,
   removeEntry,
   clearEntries,
   type NotebookEntry,
   type NotebookSource,
 } from './ui/notebook';
+import { deriveChapter } from './llm/chapters';
+import { openExamPaper } from './ui/examPaper';
 
 function $<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -579,6 +583,8 @@ const knowledgePanel = mountKnowledgePanel(canvasContainer, {
     // 量早了会按半宽取景，动画结束后图看着偏在一边
     window.setTimeout(() => window.dispatchEvent(new Event('resize')), 240);
   },
+  // 知识点整理时顺带给出了章节 → 补给题本里刚存的那条（只填空缺，手动改过的不动）
+  onChapter: (chapter) => refreshNotebook(autoFillChapter(lastSavedPrompt, chapter)),
 });
 
 /**
@@ -866,7 +872,26 @@ const notebook = mountNotebook(notebookEl, {
   onOpen: openFromNotebook,
   onDelete: (id) => refreshNotebook(removeEntry(id)),
   onClear: () => refreshNotebook(clearEntries()),
+  onSelectionChange: () => {
+    /* 勾选数由题本面板自己的选中条显示，主界面不需要跟着动 */
+  },
+  onMakePaper: (items) => {
+    openExamPaper(
+      items.map((it) => ({
+        id: it.id,
+        title: it.title,
+        prompt: it.prompt,
+        sceneJson: it.sceneJson,
+      })),
+    );
+    // 试卷在独立覆盖层，题本收起来免得背后还亮着
+    notebook.close();
+  },
+  onChapterChange: (id, chapter) => refreshNotebook(setChapter(id, chapter)),
 });
+
+/** 最近一次存进题本的题面：知识点 LLM 回来后把更准的章节补给它 */
+let lastSavedPrompt = '';
 
 /** 重绘列表 + 顶栏徽章 */
 function refreshNotebook(entries: NotebookEntry[]) {
@@ -964,7 +989,10 @@ async function generateScene(prompt: string, source: NotebookSource = 'text') {
     // 生成的场景同步填进 JSON 演示框——能看到模型到底输出了什么
     jsonInput.value = JSON.stringify(scene, null, 2);
     tabsEl.value = ''; // 生成的是自定义题目 → 下拉框回到占位项
-    // 自动存进题本：同一道题再生成只覆盖那一条，不会越堆越多
+    // 自动存进题本：同一道题再生成只覆盖那一条，不会越堆越多。
+    // 章节先由程序从约束反推（即时可用）；知识点的 LLM 回来后若给出
+    // 更准的章节，autoFillChapter 会补上（onChapter 那条线）
+    lastSavedPrompt = prompt;
     refreshNotebook(
       saveEntry({
         title: scene.meta.title,
@@ -972,6 +1000,7 @@ async function generateScene(prompt: string, source: NotebookSource = 'text') {
         sceneJson: JSON.stringify(scene, null, 2),
         source,
         issueCount: lastIssues.length,
+        chapter: deriveChapter(scene),
       }),
     );
     llmOutput.textContent =

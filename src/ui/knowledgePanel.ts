@@ -28,6 +28,11 @@ type AnyScene = Scene | Scene3D;
 export interface KnowledgePanelOpts {
   /** 展开/收起后通知外部重排画布 */
   onLayoutChange: () => void;
+  /**
+   * LLM 整理知识点时顺带给出了章节（题库归类用）。
+   * 只在真正发过请求且成功时回调一次；缓存命中不再重复通知。
+   */
+  onChapter?: (chapter: string) => void;
 }
 
 export interface KnowledgePanelApi {
@@ -51,7 +56,8 @@ export interface KnowledgePanelApi {
 }
 
 interface State {
-  keys: Map<string, KnowledgePoint[]>;
+  /** 缓存值带上章节：同题第二次打开不再请求，也不再重复回调 onChapter */
+  keys: Map<string, { points: KnowledgePoint[]; chapter: string }>;
   loadingKey: string | null;
   currentKey: string;
   points: KnowledgePoint[];
@@ -234,7 +240,7 @@ export function mountKnowledgePanel(
 
     const cached = state.keys.get(key);
     if (cached && !force) {
-      state.points = cached;
+      state.points = cached.points;
       state.note = '';
       paint();
       return;
@@ -270,15 +276,17 @@ export function mountKnowledgePanel(
 
     try {
       const facts = buildFactSheet(scene, args.params);
-      const points = await requestKnowledge(
+      const { points, chapter } = await requestKnowledge(
         problem,
         facts,
         steps.map((s) => s.title),
       );
       if (my !== token) return; // 场景已换，丢掉
-      state.keys.set(key, points);
+      state.keys.set(key, { points, chapter });
       state.points = points;
       state.note = '';
+      // 顺手把章节供给题库（手动改过的标签在 notebook 那侧有闸，不会被冲掉）
+      if (chapter) opts.onChapter?.(chapter);
     } catch (err) {
       if (my !== token) return;
       state.points = fallback;

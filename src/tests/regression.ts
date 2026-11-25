@@ -30,6 +30,9 @@ import { resolveScene3D } from '../protocol/resolve3d';
 import { sanitizeAction, stripActStream } from '../llm/actProtocol';
 import { splitReply } from '../llm/chatAgent';
 import { normalizeKnowledge, fallbackKnowledge, knowledgeKey } from '../llm/knowledge';
+import { deriveChapter, normalizeChapter } from '../llm/chapters';
+import { paperProblem, prettifyBareMath, renderPaperPrompt } from '../ui/examPaper';
+import { saveEntry, setChapter, autoFillChapter, loadEntries, importBackupEntries } from '../ui/notebook';
 import { buildFactSheet } from '../llm/factSheet';
 import { evalVec3 } from '../protocol/expr';
 import type { Point3Object, Scene3D, Scene3DObject, Vec3 } from '../protocol/scene3d';
@@ -223,6 +226,158 @@ function runE2ECases(): RowResult[] {
   }));
 }
 
+
+/* ===============================================================
+ * 题库数据层：章节归类 + 题本存取 + 备份导入
+ *
+ * 出图链路之外的第二条数据线。它坏掉的表现不是"图错了"，
+ * 而是"题没了 / 标签乱了 / 组卷选不中"——只有直接测数据层才暴露。
+ * =============================================================== */
+function runBankCases(): RowResult[] { // eslint-disable-line sonarjs/no-unused
+  const rows: RowResult[] = [];
+  const add = (name: string, why: string, ok: boolean, detail: string, gate = '题库') =>
+    rows.push({ name, why, gate, ok, detail });
+
+  // --- 章节白名单 ---
+  add(
+    '章节：normalizeChapter 白名单',
+    '模型返回的章节必须落在预定义标签集里，否则筛选栏会出现"相似三角形探究（一）"这种没法筛的东西',
+    normalizeChapter('圆') === '圆' &&
+      normalizeChapter('第二章 圆') === '圆' &&
+      // 含完整章节名的自由发挥放行为粗归类（比丢进"未分类"对老师更有用）
+      normalizeChapter('相似三角形探究专题（一）') === '三角形' &&
+      normalizeChapter(42) === '',
+    '合法值放行、含章节名的长串放行、自由发挥与非法类型拒绝',
+  );
+
+  // --- 程序反推 ---
+  const mk = (o: { space?: string; types: string[]; objTypes?: string[]; pts?: number }) =>
+    ({
+      meta: { title: 't' },
+      params: [],
+      space: o.space,
+      objects: (o.objTypes ?? (o.pts ? Array.from({ length: o.pts }, () => 'point') : []))
+        .map((t, i) => ({ id: `p${i}`, type: t })),
+      constraints: o.types.map((t) => ({ type: t, a: 'p0', b: 'p1' })),
+    }) as unknown as Scene3D;
+
+  const dc = (o: Parameters<typeof mk>[0]) => deriveChapter(mk(o));
+  const dcOk =
+    dc({ space: '3d', types: [] }) === '立体几何' &&
+    dc({ types: ['tangent'], objTypes: ['circle'] }) === '圆' &&
+    dc({ types: [], objTypes: ['curve'] }) === '函数与图象' &&
+    dc({ types: ['parallel'], pts: 4 }) === '四边形' &&
+    dc({ types: ['midpoint'], pts: 4 }) === '三角形' &&
+    dc({ types: [], pts: 3 }) === '其他';
+  add(
+    '章节：deriveChapter 从约束反推',
+    '保存题本那一刻就得有标签（LLM 可能失败/没填 Key），反推依据必须是已核验的约束类型',
+    dcOk,
+    `3D→立体几何 · 圆对象/切线→圆 · 曲线→函数 · 平行+4点→四边形 · 中点→三角形 · 裸点→其他（${dcOk ? '全对' : '有错'}）`,
+  );
+
+  // --- 题本存取（直接操作 localStorage，测完清理） ---
+  const KEY = 'mm-notebook-v1';
+  const saved = localStorage.getItem(KEY);
+  try {
+    localStorage.removeItem(KEY);
+    const ent = saveEntry({
+      title: '内切圆',
+      prompt: '求三角形内切圆半径',
+      sceneJson: '{"meta":{"title":"内切圆"}}',
+      source: 'text',
+      issueCount: 0,
+      chapter: '圆',
+    });
+    const same1 = ent.length === 1 && ent[0].chapter === '圆';
+
+    // 手动改标签后，同题再存（哪怕是程序反推出更粗的"三角形"）不能冲掉手动值
+    const afterManual = setChapter(ent[0].id, '三角形');
+    const ent2 = saveEntry({
+      title: '内切圆',
+      prompt: '求三角形内切圆半径',
+      sceneJson: '{}',
+      source: 'text',
+      issueCount: 0,
+      chapter: '圆',
+    });
+    const manualKept = ent2[0].chapter === '三角形' && ent2[0].chapterManual === true;
+
+    // autoFillChapter 只填空缺：构造一条「章节空、非手动」的条目来验证
+    const blank = structuredClone(ent2[0]);
+    blank.chapter = '';
+    blank.chapterManual = false;
+    localStorage.setItem(KEY, JSON.stringify([blank]));
+    autoFillChapter('求三角形内切圆半径', '圆');
+    const filled = loadEntries()[0].chapter === '圆';
+    autoFillChapter('求三角形内切圆半径', '四边形');
+    const notOverwritten = loadEntries()[0].chapter === '圆';
+
+    // 备份导入：新增 + 去重（直接喂结构化数据，绕开 File 读取的异步）
+    const r = importBackupEntries([
+      { prompt: '求三角形内切圆半径', sceneJson: '{}', title: '重复题' },
+      { prompt: '正方体截面问题', sceneJson: '{}', title: '新题', source: 'photo', savedAt: 1, issueCount: 2 },
+      { prompt: 123 }, // 坏条目
+    ]);
+    const all = loadEntries();
+    const importOk = r.added === 1 && r.skipped === 1 && r.invalid === 1 && all.length === 2;
+
+    const okAll = same1 && manualKept && filled && notOverwritten && importOk;
+    add(
+      '题本：保存/手动标签闸/自动补填/备份导入',
+      '手动整理的标签被生成冲掉、或备份导入把题搞丢，都是用户攒了几十道题之后才炸的静默事故',
+      okAll,
+      `同题覆盖✓ 手动优先${manualKept ? '✓' : '✗'} 自动只填空缺${filled && notOverwritten ? '✓' : '✗'} 导入新增1/跳过1/坏条1${importOk ? '✓' : '✗'}`,
+    );
+  } finally {
+    // 还原测试前的题本：不能让回归跑一次就把用户真实题本冲掉
+    if (saved !== null) localStorage.setItem(KEY, saved);
+    else localStorage.removeItem(KEY);
+  }
+
+  // --- 卷面题面清洗（拍照转录稿不上卷） ---
+  // 用户实测截图暴露：转录稿三段式（【已知】/【求证/求】/【图形结构】）
+  // 原样印到卷子上，模型自述"图片中无几何图形…"出现在学生卷面
+  const rawPrompt = [
+    '2. 【已知】1.在△ABC中。2.三边满足关系式：a² - b² = c² - sqrt(3)bc。',
+    '3.角度满足关系式：2cosB = sinC。',
+    '',
+    '2. 【求证/求】(1)判断△ABC的形状，并说明理由；(2)求△ACD的面积。',
+    '【图形结构】图片中无几何图形，仅有文字描述。根据题意描述可知：1.点A、B、C连线',
+  ].join('\n');
+  const cleaned = paperProblem(rawPrompt);
+  // 逐条拆开断言
+  const noGraphic = !cleaned.includes('图形结构');
+  const noDupNum = !/\n\s*2[.、．]\s*【/.test('\n' + cleaned) && !cleaned.startsWith('2.');
+  const mathOk = cleaned.includes('√3bc') && cleaned.includes('2cos B');
+  const secKept = cleaned.includes('【已知】') && cleaned.includes('【求证/求】');
+  const enumKept = cleaned.includes('1.在△ABC中'); // 条件列表编号不能误伤
+  // renderPaperPrompt 才是把【求证/求】折算成【求】的那一步（HTML 层）
+  const rendered = renderPaperPrompt(rawPrompt, '兜底标题');
+  const secLabel = rendered.includes('<span class="paper-sec">【已知】</span>') &&
+    rendered.includes('<span class="paper-sec">【求】</span>') &&
+    !rendered.includes('图形结构');
+  add(
+    '卷面：题面清洗（图形结构/重复题号/裸公式）',
+    '转录稿是给生成器看的，原样印卷会把"图片中无几何图形"这种模型自述印给学生',
+    noGraphic && noDupNum && mathOk && secKept && enumKept && secLabel,
+    `图形结构删除${noGraphic ? '✓' : '✗'} 重复题号${noDupNum ? '✓' : '✗'} sqrt→√${mathOk ? '✓' : '✗'} 段标题保留${secKept ? '✓' : '✗'} 条件编号保留${enumKept ? '✓' : '✗'} 卷面小标签${secLabel ? '✓' : '✗'}`,
+  );
+
+  // prettifyBareMath 的边界：多字符内容保留括号、函数名不误伤普通英文单词
+  const m1 = prettifyBareMath('sqrt(a+b) 与 sqrt(3)');
+  const m2 = prettifyBareMath('the cost is 2sinA');
+  const pOk = m1.includes('√(a+b)') && m1.includes('√3') && m2.includes('cost is 2sin A');
+  add(
+    '卷面：裸公式美化的边界',
+    'sqrt 多字符内容去括号会产生歧义（√a+b），函数名替换误伤英文单词（cost）都是潜伏 bug',
+    pOk,
+    `√(a+b)/√3 ✓ cost 不误伤 ✓`,
+  );
+
+  return rows;
+}
+
 export function runAll(): Report {  const rows = [
     ...CASES.map((c) => runOne(c, '2d')),
     ...CASES_3D.map((c) => runOne(c, '3d')),
@@ -234,6 +389,7 @@ export function runAll(): Report {  const rows = [
     ...runFoldDeriveCases3D(),
     ...runJsonRepairCases(),
     ...runLearningCases(),
+    ...runBankCases(),
     ...runRenderCases(),
     ...runE2ECases(),
   ];

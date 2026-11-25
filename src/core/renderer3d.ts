@@ -378,10 +378,15 @@ export class Scene3DRenderer {
   /** 拖拽旋转回调：给 UI 显示当前视角用（可选） */
   onViewChange?: (azimuth: number, elevation: number) => void;
 
-  constructor(container: HTMLElement) {
+  constructor(container: HTMLElement, opts?: { preserveDrawingBuffer?: boolean }) {
     this.container = container;
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    // preserveDrawingBuffer：组卷导出时离屏截图实例要打开，否则 toDataURL 是空图
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: false,
+      preserveDrawingBuffer: opts?.preserveDrawingBuffer ?? false,
+    });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setClearColor(0xf7f6f3, 1);
     const canvas = this.renderer.domElement;
@@ -418,7 +423,6 @@ export class Scene3DRenderer {
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(container);
     this.resize();
-
     const loop = () => {
       this.raf = requestAnimationFrame(loop);
       if (!this.active) {
@@ -443,6 +447,17 @@ export class Scene3DRenderer {
   // -------------------------------------------------------------
   // 对外接口
   // -------------------------------------------------------------
+
+  /**
+   * 把当前画面导出成图片（组卷/讲义用）。
+   * 只对 preserveDrawingBuffer:true 的实例有效（截图实例才会开）。
+   * 先同步 render 一次再读像素，避免读到被清空的 buffer。
+   */
+  domToDataURL(w: number, h: number): string {
+    this.renderer.setSize(w, h, false);
+    this.renderer.render(this.scene, this.camera);
+    return this.renderer.domElement.toDataURL('image/jpeg', 0.9);
+  }
 
   /**
    * 应用一份 3D 场景。
@@ -1067,9 +1082,14 @@ export class Scene3DRenderer {
 
   dispose() {
     cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    this.active = false;
     this.resizeObserver.disconnect();
     this.clearContent();
+    // forceContextLoss：离屏截图实例用完即弃，context 要立刻还回去——
+    // 浏览器全页限 ~16 个，不还的话连续截十几道题之后所有 canvas 全黑
     this.renderer.dispose();
+    this.renderer.forceContextLoss();
     this.renderer.domElement.remove();
     this.container.removeEventListener('pointerdown', this.onPointerDown);
     window.removeEventListener('pointermove', this.onPointerMove);
